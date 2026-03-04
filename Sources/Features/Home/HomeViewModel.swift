@@ -16,6 +16,8 @@ final class HomeViewModel: ObservableObject {
 
     private let homeService: HomeService
     private let transactionService: TransactionService
+    private var isMutationSyncInFlight = false
+    private var pendingMutationSyncRequest = false
 
     init(homeService: HomeService, transactionService: TransactionService) {
         self.homeService = homeService
@@ -77,6 +79,7 @@ final class HomeViewModel: ObservableObject {
                     Task { await self?.loadSnapshot() }
                 })
             }
+            scheduleMutationSync()
         }
     }
 
@@ -88,6 +91,7 @@ final class HomeViewModel: ObservableObject {
                 toast = UndoToast(message: "Transaction deleted", actionTitle: "Undo", action: { [weak self] in
                     Task { await self?.restoreDeleted(item) }
                 })
+                scheduleMutationSync()
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -156,6 +160,7 @@ final class HomeViewModel: ObservableObject {
                     updatedAt: .now
                 )
                 try await homeService.deleteTransaction(item)
+                scheduleMutationSync()
             }
             await loadSnapshot()
         } catch {
@@ -182,9 +187,42 @@ final class HomeViewModel: ObservableObject {
         do {
             _ = try await transactionService.createOrUpdateTransaction(draft)
             await loadSnapshot()
+            scheduleMutationSync()
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func scheduleMutationSync() {
+        if isMutationSyncInFlight {
+            pendingMutationSyncRequest = true
+            return
+        }
+
+        isMutationSyncInFlight = true
+        Task {
+            repeat {
+                pendingMutationSyncRequest = false
+                await runMutationSync()
+            } while pendingMutationSyncRequest
+            isMutationSyncInFlight = false
+        }
+    }
+
+    private func runMutationSync() async {
+        isSyncing = true
+        defer { isSyncing = false }
+
+        do {
+            let outcome = try await homeService.refresh()
+            syncWarningMessage = outcome.warningMessage
+        } catch {
+            if Self.isCancellation(error) {
+                return
+            }
+            syncWarningMessage = "Saved locally. Sync pending."
+        }
+        await loadSnapshot()
     }
 }
 

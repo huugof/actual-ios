@@ -1,5 +1,11 @@
 import SwiftUI
 
+private enum BudgetListLayout {
+    static let amountColumnWidth: CGFloat = 124
+    static let accessoryColumnWidth: CGFloat = 14
+    static let categoryInsetLeading: CGFloat = 10
+}
+
 struct HomeView: View {
     @StateObject private var viewModel: HomeViewModel
     private let transactionService: TransactionService
@@ -10,6 +16,8 @@ struct HomeView: View {
     @State private var categoryDetailTransactions: [RecentTransactionItem] = []
     @State private var isCategoryDetailLoading = false
     @State private var categoryEditingTarget: EditingTarget?
+    @State private var pendingDeleteItem: RecentTransactionItem?
+    @State private var isShowingDeleteConfirm = false
     @State private var isOtherBudgetsExpanded = false
 
     init(
@@ -26,15 +34,40 @@ struct HomeView: View {
         NavigationStack {
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
-                    VStack(spacing: 0) {
-                        trackedSection
-                            .padding(.horizontal, 16)
-                            .padding(.top, 8)
-                            .padding(.bottom, 8)
+                    VStack(spacing: 12) {
+                        budgetSummaryCard
+                        trackedBudgetsCard
+                        if !viewModel.otherBudgetStatuses.isEmpty {
+                            otherBudgetsCard
+                        }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+                    .padding(.bottom, 14)
                     .frame(maxWidth: .infinity)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .safeAreaInset(edge: .top) {
+                    HStack(alignment: .center, spacing: 12) {
+                        Text("Plan*d")
+                            .font(.title3.weight(.bold))
+                        Spacer()
+                        if viewModel.isSyncing {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Button {
+                            onOpenSettings()
+                        } label: {
+                            Image(systemName: "gearshape")
+                                .font(.title3.weight(.regular))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
+                }
                 .safeAreaInset(edge: .bottom) {
                     Color.clear
                         .frame(height: 112)
@@ -57,21 +90,7 @@ struct HomeView: View {
                 .padding(.bottom, 6)
                 .accessibilityLabel("Add Transaction")
             }
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    if viewModel.isSyncing {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-
-                    Button {
-                        onOpenSettings()
-                    } label: {
-                        Image(systemName: "gearshape")
-                    }
-                    .controlSize(.small)
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .onAppear {
                 viewModel.onAppear()
             }
@@ -149,12 +168,20 @@ struct HomeView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                         } else {
                             List(categoryDetailTransactions) { item in
-                                Button {
-                                    categoryEditingTarget = EditingTarget(id: item.id)
-                                } label: {
-                                    RecentTransactionRow(item: item)
-                                }
-                                .buttonStyle(.plain)
+                                RecentTransactionRow(item: item)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        categoryEditingTarget = EditingTarget(id: item.id)
+                                    }
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                        Button(role: .destructive) {
+                                            pendingDeleteItem = item
+                                            isShowingDeleteConfirm = true
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                    }
+                                    .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
                             }
                             .listStyle(.plain)
                         }
@@ -186,6 +213,23 @@ struct HomeView: View {
                     }
                 }
             }
+            .confirmationDialog("Delete transaction?", isPresented: $isShowingDeleteConfirm, titleVisibility: .visible) {
+                Button("Cancel", role: .cancel) {
+                    pendingDeleteItem = nil
+                }
+                Button("Delete", role: .destructive) {
+                    guard let item = pendingDeleteItem else { return }
+                    categoryDetailTransactions.removeAll { $0.id == item.id }
+                    viewModel.delete(item)
+                    pendingDeleteItem = nil
+                }
+            } message: {
+                if let item = pendingDeleteItem {
+                    Text("\(item.payeeName) • \(MoneyFormatter.display(minor: item.amountMinor))")
+                } else {
+                    Text("This cannot be undone.")
+                }
+            }
             .alert("Error", isPresented: Binding(
                 get: { viewModel.errorMessage != nil },
                 set: { if !$0 { viewModel.errorMessage = nil } }
@@ -197,7 +241,7 @@ struct HomeView: View {
         }
     }
 
-    private var trackedSection: some View {
+    private var budgetSummaryCard: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(monthBudgetTitle)
                 .font(.title3.weight(.semibold))
@@ -208,7 +252,7 @@ struct HomeView: View {
             .font(.system(size: 40, weight: .bold))
             .lineLimit(1)
             .minimumScaleFactor(0.75)
-            .padding(.top, 18)
+            .padding(.top, 22)
 
             Text("\(MoneyFormatter.display(minor: viewModel.overallBudget.spentMinor)) of \(MoneyFormatter.display(minor: viewModel.overallBudget.budgetedMinor)) spent")
                 .font(.subheadline)
@@ -218,24 +262,36 @@ struct HomeView: View {
             ProgressView(value: viewModel.overallBudget.progress)
                 .tint(viewModel.overallBudget.isOverBudget ? .red : .green)
                 .scaleEffect(x: 1, y: 1.45, anchor: .center)
-                .padding(.top, 16)
+                .padding(.top, 20)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 24)
+        .padding(.bottom, 18)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
 
+    private var trackedBudgetsCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text("Tracked Budget")
-                    .font(.title3.weight(.semibold))
+                Text("Tracked Budgets")
+                    .font(.headline.weight(.semibold))
                 Spacer()
                 Text(MoneyFormatter.display(minor: trackedBudgetsTotalRemaining))
-                    .font(.title3.weight(.bold))
+                    .font(.headline.weight(.bold))
                     .foregroundStyle(trackedBudgetsTotalRemaining < 0 ? .red : .primary)
+                    .frame(width: BudgetListLayout.amountColumnWidth, alignment: .trailing)
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.clear)
+                    .frame(width: BudgetListLayout.accessoryColumnWidth, alignment: .trailing)
             }
-            .padding(.top, 24)
-            .padding(.bottom, 6)
+            .padding(.bottom, 8)
 
             if viewModel.trackedStatuses.isEmpty {
                 Text("No tracked categories configured yet.")
                     .foregroundStyle(.secondary)
                     .font(.body)
-                    .padding(.top, 14)
+                    .padding(.top, 8)
             } else {
                 ForEach(viewModel.trackedStatuses.indices, id: \.self) { index in
                     let status = viewModel.trackedStatuses[index]
@@ -245,64 +301,55 @@ struct HomeView: View {
                     ExpenseCategoryRow(status: status) {
                         openCategoryDetail(status)
                     }
-                    .padding(.vertical, 14)
+                    .padding(.leading, BudgetListLayout.categoryInsetLeading)
+                    .padding(.vertical, 16)
                 }
-            }
-
-            if !viewModel.otherBudgetStatuses.isEmpty {
-                otherBudgetsSection
-                    .padding(.top, 12)
             }
         }
         .padding(.horizontal, 18)
-        .padding(.top, 18)
-        .padding(.bottom, 8)
+        .padding(.top, 20)
+        .padding(.bottom, 14)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
-    private var monthBudgetTitle: String {
-        let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.setLocalizedDateFormatFromTemplate("MMMM")
-        return "\(formatter.string(from: .now)) Budget"
-    }
-
-    private var otherBudgetsSection: some View {
+    private var otherBudgetsCard: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Divider()
-                .padding(.bottom, 8)
             Button {
                 isOtherBudgetsExpanded.toggle()
             } label: {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text("Other Budgets")
-                        .font(.title3.weight(.semibold))
+                        .font(.headline.weight(.semibold))
                     Spacer()
                     Text(MoneyFormatter.display(minor: otherBudgetsTotalRemaining))
-                        .font(.title3.weight(.bold))
+                        .font(.headline.weight(.bold))
                         .foregroundStyle(otherBudgetsTotalRemaining < 0 ? .red : .primary)
+                        .frame(width: BudgetListLayout.amountColumnWidth, alignment: .trailing)
                     Image(systemName: isOtherBudgetsExpanded ? "chevron.up" : "chevron.down")
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(.tertiary)
+                        .frame(width: BudgetListLayout.accessoryColumnWidth, alignment: .trailing)
                 }
-                .padding(.vertical, 10)
+                .padding(.vertical, 12)
             }
             .buttonStyle(.plain)
 
             if isOtherBudgetsExpanded {
                 Divider()
+                    .padding(.bottom, 2)
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(groupedOtherBudgets) { group in
                         Text(group.name)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
-                            .padding(.top, 10)
+                            .padding(.top, 12)
                             .padding(.bottom, 6)
                         ForEach(group.items) { status in
                             ExpenseCategoryRow(status: status) {
                                 openCategoryDetail(status)
                             }
-                            .padding(.vertical, 11)
+                            .padding(.leading, BudgetListLayout.categoryInsetLeading)
+                            .padding(.vertical, 13)
                             if status.id != group.items.last?.id {
                                 Divider()
                             }
@@ -312,9 +359,20 @@ struct HomeView: View {
                 .padding(.bottom, 4)
             }
         }
+        .padding(.horizontal, 18)
+        .padding(.top, 8)
+        .padding(.bottom, isOtherBudgetsExpanded ? 14 : 8)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
         .transaction { transaction in
             transaction.animation = nil
         }
+    }
+
+    private var monthBudgetTitle: String {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("MMMM")
+        return "\(formatter.string(from: .now)) Budget"
     }
 
     private var otherBudgetsTotalRemaining: Int64 {
@@ -408,18 +466,20 @@ private struct ExpenseCategoryRow: View {
         Button(action: onOpenDetail) {
             HStack(alignment: .center, spacing: 10) {
                 Text(status.name)
-                    .font(.title3.weight(.medium))
+                    .font(.subheadline.weight(.regular))
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
                 Spacer()
                 Text(MoneyFormatter.display(minor: status.remainingMinor))
-                    .font(.title2.weight(.bold))
+                    .font(.body.weight(.semibold))
                     .foregroundStyle(status.isOverBudget ? .red : .primary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
+                    .frame(width: BudgetListLayout.amountColumnWidth, alignment: .trailing)
                 Image(systemName: "chevron.right")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(.tertiary)
+                    .frame(width: BudgetListLayout.accessoryColumnWidth, alignment: .trailing)
             }
         }
         .buttonStyle(.plain)
@@ -441,10 +501,22 @@ private struct OtherBudgetGroup: Identifiable {
 
 private struct RecentTransactionRow: View {
     let item: RecentTransactionItem
+    private static let rawDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+    private static let displayDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("MMMd")
+        return formatter
+    }()
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(item.date.value)
+            Text(displayDateText)
                 .font(.footnote.monospacedDigit())
                 .foregroundStyle(.secondary)
             Text(item.payeeName)
@@ -464,6 +536,14 @@ private struct RecentTransactionRow: View {
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 2)
+        .frame(minHeight: 44)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var displayDateText: String {
+        guard let date = Self.rawDateFormatter.date(from: item.date.value) else {
+            return item.date.value
+        }
+        return Self.displayDateFormatter.string(from: date)
     }
 }

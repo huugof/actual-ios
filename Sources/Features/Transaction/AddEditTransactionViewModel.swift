@@ -58,6 +58,34 @@ final class AddEditTransactionViewModel: ObservableObject {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
+    var topPayeeSuggestion: Payee? {
+        let typed = payeeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty else { return nil }
+        let typedLower = typed.lowercased()
+        if let exact = payeeSuggestions.first(where: {
+            $0.name.lowercased() == typedLower
+        }) {
+            return exact
+        }
+        return payeeSuggestions.first(where: {
+            let nameLower = $0.name.lowercased()
+            return nameLower.hasPrefix(typedLower) && $0.name.count > typed.count
+        })
+    }
+
+    var payeeGhostSuffix: String {
+        let typed = payeeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty, let suggestion = topPayeeSuggestion else { return "" }
+        let suggestionName = suggestion.name
+        guard suggestionName.count > typed.count,
+              suggestionName.lowercased().hasPrefix(typed.lowercased()),
+              let splitIndex = suggestionName.index(suggestionName.startIndex, offsetBy: typed.count, limitedBy: suggestionName.endIndex)
+        else {
+            return ""
+        }
+        return String(suggestionName[splitIndex...])
+    }
+
     init(mode: Mode, service: TransactionService) {
         self.mode = mode
         self.service = service
@@ -116,10 +144,10 @@ final class AddEditTransactionViewModel: ObservableObject {
                 }
 
                 payeeSuggestions = suggestions
-                if let topPrefixMatch = suggestions.first(where: {
-                    $0.name.lowercased().hasPrefix(trimmed.lowercased())
+                if let exact = suggestions.first(where: {
+                    $0.name.caseInsensitiveCompare(trimmed) == .orderedSame
                 }) {
-                    selectedPayee = .existing(id: topPrefixMatch.id)
+                    selectedPayee = .existing(id: exact.id)
                 } else {
                     selectedPayee = .new(name: trimmed)
                 }
@@ -137,6 +165,25 @@ final class AddEditTransactionViewModel: ObservableObject {
     func selectPayee(_ payee: Payee) {
         selectedPayee = .existing(id: payee.id)
         payeeText = payee.name
+        payeeSuggestions = []
+        updateCanSave()
+    }
+
+    func acceptTopPayeeSuggestion() {
+        let typed = payeeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty else { return }
+        if let exact = payeeSuggestions.first(where: {
+            $0.name.caseInsensitiveCompare(typed) == .orderedSame
+        }) {
+            selectPayee(exact)
+            return
+        }
+        if let suggestion = topPayeeSuggestion {
+            selectPayee(suggestion)
+            return
+        }
+        selectedPayee = .new(name: typed)
+        payeeText = typed
         updateCanSave()
     }
 

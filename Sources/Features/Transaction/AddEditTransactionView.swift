@@ -97,12 +97,35 @@ struct AddEditTransactionView: View {
             Text("Payee")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            TextField("Type payee", text: Binding(
-                get: { viewModel.payeeText },
-                set: { viewModel.updatePayeeQuery($0) }
-            ))
-            .focused($focusedField, equals: .payee)
-            .textFieldStyle(.roundedBorder)
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(.secondarySystemBackground))
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color(.separator).opacity(0.45), lineWidth: 1)
+
+                HStack(spacing: 0) {
+                    Text(viewModel.payeeText)
+                        .foregroundStyle(.clear)
+                    Text(viewModel.payeeGhostSuffix)
+                        .foregroundStyle(.secondary.opacity(0.6))
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .allowsHitTesting(false)
+
+                TextField("Type payee", text: Binding(
+                    get: { viewModel.payeeText },
+                    set: { viewModel.updatePayeeQuery($0) }
+                ))
+                .focused($focusedField, equals: .payee)
+                .submitLabel(.done)
+                .onSubmit {
+                    viewModel.acceptTopPayeeSuggestion()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+            }
+            .frame(minHeight: 42)
         }
     }
 

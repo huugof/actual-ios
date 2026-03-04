@@ -106,16 +106,31 @@ actor TransactionService {
         return nil
     }
 
+    static func normalizedOutflowMinor(_ amountMinor: Int64) -> Int64 {
+        guard amountMinor != 0 else { return 0 }
+        return -abs(amountMinor)
+    }
+
+    static func normalizedOutflowSplits(_ splits: [TransactionSplit]) -> [APISplitPayload] {
+        splits.map { split in
+            APISplitPayload(
+                categoryID: split.categoryID,
+                amountMinor: normalizedOutflowMinor(split.amountMinor)
+            )
+        }
+    }
+
     private func buildMutation(for draft: TransactionDraft, localID: UUID) throws -> PendingMutation {
         let now = Date.now
         let payloadEncoder = JSONEncoder()
 
         switch draft.categoryMode {
         case .single(let categoryID):
+            let normalizedAmount = Self.normalizedOutflowMinor(draft.amountMinor)
             let payload = APICreateTransactionPayload(
                 accountID: draft.accountID,
                 date: draft.date.value,
-                amountMinor: draft.amountMinor,
+                amountMinor: normalizedAmount,
                 payeeID: existingPayeeID(from: draft.payee),
                 payeeName: {
                     if case .new(let name) = draft.payee { return name }
@@ -165,11 +180,12 @@ actor TransactionService {
             )
 
         case .split(let splits):
-            let splitPayload = splits.map { APISplitPayload(categoryID: $0.categoryID, amountMinor: $0.amountMinor) }
+            let splitPayload = Self.normalizedOutflowSplits(splits)
+            let normalizedTotal = splitPayload.reduce(Int64(0)) { $0 + $1.amountMinor }
             let payload = APICreateTransactionPayload(
                 accountID: draft.accountID,
                 date: draft.date.value,
-                amountMinor: draft.amountMinor,
+                amountMinor: normalizedTotal,
                 payeeID: existingPayeeID(from: draft.payee),
                 payeeName: {
                     if case .new(let name) = draft.payee { return name }
