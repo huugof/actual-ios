@@ -7,6 +7,7 @@ private enum BudgetListLayout {
 }
 
 struct HomeView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @StateObject private var viewModel: HomeViewModel
     private let transactionService: TransactionService
     private let onOpenSettings: () -> Void
@@ -48,25 +49,42 @@ struct HomeView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .safeAreaInset(edge: .top) {
-                    HStack(alignment: .center, spacing: 12) {
-                        Text("Plan*d")
-                            .font(.title3.weight(.bold))
-                        Spacer()
-                        if viewModel.isSyncing {
-                            ProgressView()
-                                .controlSize(.small)
+                    VStack(spacing: 0) {
+                        HStack(alignment: .center, spacing: 12) {
+                            Text("Plan*d")
+                                .font(.title3.weight(.bold))
+                            Spacer()
+                            if viewModel.isSyncing {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Button {
+                                onOpenSettings()
+                            } label: {
+                                Image(systemName: "gearshape")
+                                    .font(.title3.weight(.regular))
+                            }
+                            .buttonStyle(.plain)
                         }
-                        Button {
-                            onOpenSettings()
-                        } label: {
-                            Image(systemName: "gearshape")
-                                .font(.title3.weight(.regular))
-                        }
-                        .buttonStyle(.plain)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                        .padding(.bottom, 8)
+
+                        Color.clear
+                            .frame(height: 18)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 6)
-                    .padding(.bottom, 8)
+                    .background(
+                        LinearGradient(
+                            colors: [
+                                topBarGradientBase,
+                                topBarGradientBase.opacity(0.95),
+                                topBarGradientBase.opacity(0.55),
+                                topBarGradientBase.opacity(0.0)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
                 }
                 .safeAreaInset(edge: .bottom) {
                     Color.clear
@@ -373,6 +391,10 @@ struct HomeView: View {
         formatter.locale = .current
         formatter.setLocalizedDateFormatFromTemplate("MMMM")
         return "\(formatter.string(from: .now)) Budget"
+    }
+
+    private var topBarGradientBase: Color {
+        colorScheme == .dark ? .black : .white
     }
 
     private var otherBudgetsTotalRemaining: Int64 {
