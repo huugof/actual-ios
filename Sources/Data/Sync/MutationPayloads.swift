@@ -26,6 +26,7 @@ struct UpdateTransactionMutation: Codable, Sendable {
 struct DeleteTransactionMutation: Codable, Sendable {
     let localTransactionID: UUID
     let remoteTransactionID: String?
+    let accountID: String?
 }
 
 struct CreatePayeeMutation: Codable, Sendable {

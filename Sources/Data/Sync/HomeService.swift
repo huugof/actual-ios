@@ -16,8 +16,12 @@ actor HomeService {
         return try await database.fetchHomeSnapshot(filterMode: filterMode, recentLimit: 20)
     }
 
-    func refresh() async throws -> SyncOutcome {
-        try await syncEngine.syncNow()
+    func refreshFull() async throws -> SyncOutcome {
+        try await syncEngine.sync(mode: .full)
+    }
+
+    func refreshAfterMutation() async throws -> SyncOutcome {
+        try await syncEngine.sync(mode: .mutationFast)
     }
 
     func processQueueOnly() async throws {

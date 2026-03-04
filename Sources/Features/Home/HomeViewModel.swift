@@ -50,7 +50,7 @@ final class HomeViewModel: ObservableObject {
         isSyncing = true
         defer { isSyncing = false }
         do {
-            let outcome = try await homeService.refresh()
+            let outcome = try await homeService.refreshFull()
             syncWarningMessage = outcome.warningMessage
             await loadSnapshot()
         } catch {
@@ -214,7 +214,7 @@ final class HomeViewModel: ObservableObject {
         defer { isSyncing = false }
 
         do {
-            let outcome = try await homeService.refresh()
+            let outcome = try await homeService.refreshAfterMutation()
             syncWarningMessage = outcome.warningMessage
         } catch {
             if Self.isCancellation(error) {

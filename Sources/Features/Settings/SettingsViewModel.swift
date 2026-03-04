@@ -133,7 +133,7 @@ final class SettingsViewModel: ObservableObject {
                 lastSavedConfig = currentConfig
 
                 if connectionChanged {
-                    _ = try await homeService.refresh()
+                    _ = try await homeService.refreshFull()
                     allCategories = try await homeService.fetchAllCategories()
                 }
             }

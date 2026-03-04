@@ -80,7 +80,11 @@ actor TransactionService {
     func deleteTransaction(_ item: RecentTransactionItem) async throws {
         try await database.deleteTransaction(localID: item.id)
 
-        let payload = DeleteTransactionMutation(localTransactionID: item.id, remoteTransactionID: item.remoteID)
+        let payload = DeleteTransactionMutation(
+            localTransactionID: item.id,
+            remoteTransactionID: item.remoteID,
+            accountID: item.accountID
+        )
         let envelope = MutationEnvelope(data: payload)
         let encoded = try JSONEncoder().encode(envelope)
 

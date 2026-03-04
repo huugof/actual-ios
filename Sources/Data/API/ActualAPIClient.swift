@@ -5,7 +5,7 @@ protocol ActualAPIClientProtocol: Sendable {
     func fetchAccounts() async throws -> [Account]
     func fetchPayees() async throws -> [Payee]
     func fetchCategories() async throws -> [CategorySyncPayload]
-    func fetchRecentTransactions(limit: Int) async throws -> [RecentTransactionItem]
+    func fetchRecentTransactions(limit: Int, daysBack: Int, accountIDs: [String]?) async throws -> [RecentTransactionItem]
     func createPayee(name: String) async throws -> Payee
     func createTransaction(payload: APICreateTransactionPayload) async throws -> APISavedTransaction
     func updateTransaction(id: String, payload: APIUpdateTransactionPayload) async throws -> APISavedTransaction
@@ -259,11 +259,17 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
         }
     }
 
-    func fetchRecentTransactions(limit: Int) async throws -> [RecentTransactionItem] {
-        let accounts = try await fetchAccounts()
+    func fetchRecentTransactions(limit: Int, daysBack: Int, accountIDs: [String]?) async throws -> [RecentTransactionItem] {
+        let accounts: [Account]
+        if let accountIDs {
+            let uniqueIDs = Self.uniquePreservingOrder(accountIDs)
+            accounts = uniqueIDs.map { Account(id: $0, name: $0) }
+        } else {
+            accounts = try await fetchAccounts()
+        }
         guard !accounts.isEmpty else { return [] }
 
-        let sinceDate = Self.isoDateString(daysBack: 60)
+        let sinceDate = Self.isoDateString(daysBack: daysBack)
         var allTransactions: [TransactionDTO] = []
         var failures: [String] = []
         await withTaskGroup(of: (String, Result<[TransactionDTO], Error>).self) { group in

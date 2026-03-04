@@ -1,32 +1,83 @@
 import Foundation
+import OSLog
 
 struct SyncOutcome: Sendable {
     let warningMessage: String?
 }
 
+enum SyncMode: String, Sendable {
+    case full
+    case mutationFast
+}
+
+struct MutationProcessingReport: Sendable {
+    var processedCount: Int = 0
+    var processedTransactionMutation = false
+    var touchedAccountIDs: Set<String> = []
+
+    mutating func record(_ result: MutationApplyResult) {
+        processedCount += 1
+        if result.isTransactionMutation {
+            processedTransactionMutation = true
+        }
+        if let accountID = result.touchedAccountID, !accountID.isEmpty {
+            touchedAccountIDs.insert(accountID)
+        }
+    }
+}
+
+struct MutationApplyResult: Sendable {
+    let isTransactionMutation: Bool
+    let touchedAccountID: String?
+}
+
 actor SyncEngine {
     private let database: DatabaseService
     private let api: ActualAPIClientProtocol
+    private let logger = Logger(subsystem: "ActualCompanion", category: "Sync")
 
     init(database: DatabaseService, api: ActualAPIClientProtocol) {
         self.database = database
         self.api = api
     }
 
-    func syncNow() async throws -> SyncOutcome {
+    func sync(mode: SyncMode) async throws -> SyncOutcome {
+        let startedAt = Date()
         var warnings: [String] = []
 
-        if let warning = try await refreshReferenceDataAndRecents() {
-            warnings.append(warning)
+        let report = try await processPendingMutationsDraining()
+        switch mode {
+        case .full:
+            if let warning = try await refreshReferenceDataAndRecents() {
+                warnings.append(warning)
+            }
+        case .mutationFast:
+            if report.processedTransactionMutation {
+                let accountIDs = report.touchedAccountIDs.isEmpty ? nil : Array(report.touchedAccountIDs)
+                if let warning = try await refreshRecentTransactionsOnly(
+                    limit: 60,
+                    daysBack: 60,
+                    accountIDs: accountIDs
+                ) {
+                    warnings.append(warning)
+                }
+            }
         }
-        try await processPendingMutations()
-        if let warning = try await refreshReferenceDataAndRecents() {
-            warnings.append(warning)
-        }
+
+        #if DEBUG
+        let durationMS = Int(Date.now.timeIntervalSince(startedAt) * 1000)
+        logger.debug(
+            "sync mode=\(mode.rawValue, privacy: .public) processed=\(report.processedCount) warnings=\(warnings.count) duration_ms=\(durationMS)"
+        )
+        #endif
 
         return SyncOutcome(
             warningMessage: warnings.isEmpty ? nil : warnings.joined(separator: "\n")
         )
+    }
+
+    func syncNow() async throws -> SyncOutcome {
+        try await sync(mode: .full)
     }
 
     func refreshReferenceDataAndRecents() async throws -> String? {
@@ -55,46 +106,79 @@ actor SyncEngine {
             }
         }
 
-        do {
-            async let pendingDeleteIDs = database.fetchPendingDeleteTransactionLocalIDs()
-            let fetchedRecents = try await api.fetchRecentTransactions(limit: 60)
-            let pendingDeletes = try await pendingDeleteIDs
-            let filteredRecents = fetchedRecents.filter { !pendingDeletes.contains($0.id) }
-            try await database.upsertRecentTransactions(filteredRecents)
-        } catch {
-            if let warning = Self.softSyncWarning(prefix: "Recent transactions refresh skipped", error: error) {
-                warnings.append(warning)
-            }
+        if let warning = try await refreshRecentTransactionsOnly(
+            limit: 60,
+            daysBack: 60,
+            accountIDs: nil
+        ) {
+            warnings.append(warning)
         }
 
         return warnings.isEmpty ? nil : warnings.joined(separator: "\n")
     }
 
     func processPendingMutations() async throws {
-        let mutations = try await database.fetchReadyMutations(limit: 20)
-        for mutation in mutations {
-            try await database.markMutationSyncing(mutation.id)
-            do {
-                try await applyMutation(mutation)
-                try await database.markMutationCompleted(mutation.id)
-            } catch {
-                let retryCount = mutation.retryCount + 1
-                if retryCount > 8 {
-                    try await database.markMutationPermanentFailure(mutation.id, lastError: error.localizedDescription)
-                } else {
-                    let delay = retryDelay(for: retryCount)
-                    try await database.markMutationFailed(
-                        mutation.id,
-                        retryCount: retryCount,
-                        delay: delay,
-                        lastError: error.localizedDescription
-                    )
+        _ = try await processPendingMutationsDraining()
+    }
+
+    private func processPendingMutationsDraining(
+        batchSize: Int = 50,
+        maxBatches: Int = 20
+    ) async throws -> MutationProcessingReport {
+        var report = MutationProcessingReport()
+        for _ in 0..<maxBatches {
+            let mutations = try await database.fetchReadyMutations(limit: batchSize)
+            if mutations.isEmpty {
+                break
+            }
+
+            for mutation in mutations {
+                try await database.markMutationSyncing(mutation.id)
+                do {
+                    let result = try await applyMutation(mutation)
+                    try await database.markMutationCompleted(mutation.id)
+                    report.record(result)
+                } catch {
+                    let retryCount = mutation.retryCount + 1
+                    if retryCount > 8 {
+                        try await database.markMutationPermanentFailure(mutation.id, lastError: error.localizedDescription)
+                    } else {
+                        let delay = retryDelay(for: retryCount)
+                        try await database.markMutationFailed(
+                            mutation.id,
+                            retryCount: retryCount,
+                            delay: delay,
+                            lastError: error.localizedDescription
+                        )
+                    }
                 }
             }
         }
+        return report
     }
 
-    private func applyMutation(_ mutation: PendingMutation) async throws {
+    private func refreshRecentTransactionsOnly(
+        limit: Int,
+        daysBack: Int,
+        accountIDs: [String]?
+    ) async throws -> String? {
+        do {
+            async let pendingDeleteIDs = database.fetchPendingDeleteTransactionLocalIDs()
+            let fetchedRecents = try await api.fetchRecentTransactions(
+                limit: limit,
+                daysBack: daysBack,
+                accountIDs: accountIDs
+            )
+            let pendingDeletes = try await pendingDeleteIDs
+            let filteredRecents = fetchedRecents.filter { !pendingDeletes.contains($0.id) }
+            try await database.upsertRecentTransactions(filteredRecents)
+            return nil
+        } catch {
+            return Self.softSyncWarning(prefix: "Recent transactions refresh skipped", error: error)
+        }
+    }
+
+    private func applyMutation(_ mutation: PendingMutation) async throws -> MutationApplyResult {
         switch mutation.type {
         case .createTransaction:
             let envelope = try JSONDecoder().decode(MutationEnvelope<CreateTransactionMutation>.self, from: mutation.payload)
@@ -106,10 +190,18 @@ actor SyncEngine {
                 // Remove optimistic row and rely on post-mutation refresh to repopulate authoritative remote records.
                 try await database.deleteTransaction(localID: envelope.data.localTransactionID)
             }
+            return MutationApplyResult(
+                isTransactionMutation: true,
+                touchedAccountID: envelope.data.payload.accountID
+            )
 
         case .updateTransaction:
             let envelope = try JSONDecoder().decode(MutationEnvelope<UpdateTransactionMutation>.self, from: mutation.payload)
             _ = try await api.updateTransaction(id: envelope.data.remoteTransactionID, payload: envelope.data.payload)
+            return MutationApplyResult(
+                isTransactionMutation: true,
+                touchedAccountID: envelope.data.payload.accountID
+            )
 
         case .deleteTransaction:
             let envelope = try JSONDecoder().decode(MutationEnvelope<DeleteTransactionMutation>.self, from: mutation.payload)
@@ -121,11 +213,16 @@ actor SyncEngine {
                 }
             }
             try await database.deleteTransaction(localID: envelope.data.localTransactionID)
+            return MutationApplyResult(
+                isTransactionMutation: true,
+                touchedAccountID: envelope.data.accountID
+            )
 
         case .createPayee:
             let envelope = try JSONDecoder().decode(MutationEnvelope<CreatePayeeMutation>.self, from: mutation.payload)
             let payee = try await api.createPayee(name: envelope.data.proposedName)
             try await database.upsertPayee(payee)
+            return MutationApplyResult(isTransactionMutation: false, touchedAccountID: nil)
         }
     }
 
