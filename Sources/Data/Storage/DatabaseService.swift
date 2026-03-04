@@ -178,6 +178,18 @@ actor DatabaseService {
         }
     }
 
+    func applyCategoryBudgetSnapshots(_ snapshots: [CategoryBudgetSnapshot]) async throws {
+        guard !snapshots.isEmpty else { return }
+        try await dbQueue.write { db in
+            for snapshot in snapshots {
+                try db.execute(
+                    sql: "UPDATE categories SET budgetedMinor = ?, spentMinor = ?, updatedAt = ? WHERE id = ?",
+                    arguments: [snapshot.budgetedMinor, snapshot.spentMinor, Date.now, snapshot.id]
+                )
+            }
+        }
+    }
+
     func fetchAccounts() async throws -> [Account] {
         try await dbQueue.read { db in
             try AccountRow.order(Column("name")).fetchAll(db).map(\.domain)

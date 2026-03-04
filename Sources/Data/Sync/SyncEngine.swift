@@ -54,11 +54,19 @@ actor SyncEngine {
         case .mutationFast:
             if report.processedTransactionMutation {
                 let accountIDs = report.touchedAccountIDs.isEmpty ? nil : Array(report.touchedAccountIDs)
-                if let warning = try await refreshRecentTransactionsOnly(
+                async let recentsWarning = refreshRecentTransactionsOnly(
                     limit: 60,
                     daysBack: 60,
                     accountIDs: accountIDs
-                ) {
+                )
+                async let budgetsWarning = refreshCategoryBudgetsOnly(
+                    monthCandidates: Self.budgetMonthCandidates()
+                )
+
+                if let warning = try await recentsWarning {
+                    warnings.append(warning)
+                }
+                if let warning = try await budgetsWarning {
                     warnings.append(warning)
                 }
             }
@@ -178,6 +186,16 @@ actor SyncEngine {
         }
     }
 
+    private func refreshCategoryBudgetsOnly(monthCandidates: [String]) async throws -> String? {
+        do {
+            let snapshots = try await api.fetchCategoryBudgetSnapshots(monthCandidates: monthCandidates)
+            try await database.applyCategoryBudgetSnapshots(snapshots)
+            return nil
+        } catch {
+            return Self.softSyncWarning(prefix: "Category budget refresh skipped", error: error)
+        }
+    }
+
     private func applyMutation(_ mutation: PendingMutation) async throws -> MutationApplyResult {
         switch mutation.type {
         case .createTransaction:
@@ -252,5 +270,19 @@ actor SyncEngine {
             return "\(prefix): \(message)"
         }
         return "\(prefix): \(error.localizedDescription)"
+    }
+
+    private static func budgetMonthCandidates(calendar: Calendar = .current) -> [String] {
+        let current = Self.monthString(offset: 0, calendar: calendar)
+        let previous = Self.monthString(offset: -1, calendar: calendar)
+        return [current, previous]
+    }
+
+    private static func monthString(offset: Int, calendar: Calendar) -> String {
+        let date = calendar.date(byAdding: .month, value: offset, to: .now) ?? .now
+        let components = calendar.dateComponents([.year, .month], from: date)
+        let year = components.year ?? 1970
+        let month = components.month ?? 1
+        return String(format: "%04d-%02d", year, month)
     }
 }

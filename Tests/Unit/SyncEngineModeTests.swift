@@ -15,6 +15,7 @@ final class SyncEngineModeTests: XCTestCase {
         XCTAssertEqual(stats.fetchAccountsCount, 0)
         XCTAssertEqual(stats.fetchPayeesCount, 0)
         XCTAssertEqual(stats.fetchRecentRequests.count, 1)
+        XCTAssertEqual(stats.fetchBudgetSnapshotRequests.count, 1)
         XCTAssertEqual(stats.updateTransactionCount, 1)
         XCTAssertEqual(Set(stats.fetchRecentRequests[0].accountIDs ?? []), Set(["acct-1"]))
         XCTAssertEqual(stats.fetchRecentRequests[0].daysBack, 60)
@@ -32,6 +33,7 @@ final class SyncEngineModeTests: XCTestCase {
         XCTAssertEqual(stats.fetchAccountsCount, 1)
         XCTAssertEqual(stats.fetchPayeesCount, 1)
         XCTAssertEqual(stats.fetchRecentRequests.count, 1)
+        XCTAssertEqual(stats.fetchBudgetSnapshotRequests.count, 0)
     }
 
     func testMutationDrainProcessesMoreThanOneBatch() async throws {
@@ -49,6 +51,7 @@ final class SyncEngineModeTests: XCTestCase {
         XCTAssertEqual(stats.createPayeeCount, 120)
         XCTAssertEqual(try await database.pendingMutationCount(), 0)
         XCTAssertEqual(stats.fetchRecentRequests.count, 0)
+        XCTAssertEqual(stats.fetchBudgetSnapshotRequests.count, 0)
     }
 
     func testRetryBackoffPreventsImmediateRetry() async throws {
@@ -68,6 +71,30 @@ final class SyncEngineModeTests: XCTestCase {
         let secondStats = await api.snapshot()
         XCTAssertEqual(secondStats.updateTransactionCount, 1)
         XCTAssertEqual(try await database.pendingMutationCount(), 1)
+        XCTAssertEqual(secondStats.fetchBudgetSnapshotRequests.count, 0)
+    }
+
+    func testMutationFastAppliesBudgetSnapshotsToLocalCategories() async throws {
+        let database = try makeDatabase()
+        let api = MockAPIClient()
+        let engine = SyncEngine(database: database, api: api)
+
+        try await database.upsertCategories([
+            CategorySyncPayload(
+                id: "food",
+                name: "Food",
+                groupName: "Needs",
+                isIncome: false,
+                budgetedMinor: 100_00,
+                spentMinor: 0
+            )
+        ])
+        try await enqueueUpdateMutation(database: database, accountID: "acct-1")
+
+        _ = try await engine.sync(mode: .mutationFast)
+
+        let snapshot = try await database.fetchHomeSnapshot(filterMode: .all, recentLimit: 10)
+        XCTAssertEqual(snapshot.overallBudget.spentMinor, 40_00)
     }
 
     private func makeDatabase() throws -> DatabaseService {
@@ -136,6 +163,7 @@ private struct MockStats: Sendable {
     var fetchPayeesCount = 0
     var fetchCategoriesCount = 0
     var fetchRecentRequests: [RecentRequest] = []
+    var fetchBudgetSnapshotRequests: [[String]] = []
     var createPayeeCount = 0
     var createTransactionCount = 0
     var updateTransactionCount = 0
@@ -175,6 +203,13 @@ private actor MockAPIClient: ActualAPIClientProtocol {
             RecentRequest(limit: limit, daysBack: daysBack, accountIDs: accountIDs)
         )
         return []
+    }
+
+    func fetchCategoryBudgetSnapshots(monthCandidates: [String]) async throws -> [CategoryBudgetSnapshot] {
+        stats.fetchBudgetSnapshotRequests.append(monthCandidates)
+        return [
+            CategoryBudgetSnapshot(id: "food", budgetedMinor: 100_00, spentMinor: 40_00)
+        ]
     }
 
     func createPayee(name: String) async throws -> Payee {

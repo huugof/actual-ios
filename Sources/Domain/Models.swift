@@ -38,6 +38,12 @@ struct Category: Codable, Equatable, Identifiable, Sendable {
     let isIncome: Bool
 }
 
+struct CategoryBudgetSnapshot: Codable, Equatable, Identifiable, Sendable {
+    let id: String
+    let budgetedMinor: Int64
+    let spentMinor: Int64
+}
+
 struct CategoryBudgetStatus: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let name: String

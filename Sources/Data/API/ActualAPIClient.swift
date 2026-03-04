@@ -5,6 +5,7 @@ protocol ActualAPIClientProtocol: Sendable {
     func fetchAccounts() async throws -> [Account]
     func fetchPayees() async throws -> [Payee]
     func fetchCategories() async throws -> [CategorySyncPayload]
+    func fetchCategoryBudgetSnapshots(monthCandidates: [String]) async throws -> [CategoryBudgetSnapshot]
     func fetchRecentTransactions(limit: Int, daysBack: Int, accountIDs: [String]?) async throws -> [RecentTransactionItem]
     func createPayee(name: String) async throws -> Payee
     func createTransaction(payload: APICreateTransactionPayload) async throws -> APISavedTransaction
@@ -257,6 +258,32 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
                 spentMinor: budgetSnapshot?.spent ?? 0
             )
         }
+    }
+
+    func fetchCategoryBudgetSnapshots(monthCandidates: [String]) async throws -> [CategoryBudgetSnapshot] {
+        let candidates = Self.uniquePreservingOrder(
+            monthCandidates.flatMap { Self.monthCandidates(from: $0) }
+        )
+        let fallbackCandidates = Self.uniquePreservingOrder(
+            candidates + [Self.currentMonthString()] + Self.recentMonthFallbacks(count: 2)
+        )
+
+        var lastError: Error?
+        for month in fallbackCandidates {
+            do {
+                let snapshots = try await monthCategorySnapshotsFast(month: month)
+                if !snapshots.isEmpty {
+                    return snapshots
+                }
+            } catch {
+                lastError = error
+            }
+        }
+
+        if let lastError {
+            throw lastError
+        }
+        throw APIClientError.invalidResponse(details: "Unable to load month category budget snapshots")
     }
 
     func fetchRecentTransactions(limit: Int, daysBack: Int, accountIDs: [String]?) async throws -> [RecentTransactionItem] {
@@ -696,6 +723,27 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
             }
         }
         return (budgets: budgets, groupNames: groupNames, groupIDs: groupIDs)
+    }
+
+    private func monthCategorySnapshotsFast(month: String) async throws -> [CategoryBudgetSnapshot] {
+        let data = try await request(
+            path: "months/\(month)/categories",
+            method: "GET",
+            timeoutInterval: 5,
+            body: Optional<String>.none
+        )
+        let monthCategories = try decodeList(
+            MonthCategoryDTO.self,
+            from: data,
+            context: "GET months/\(month)/categories"
+        )
+        return monthCategories.map { row in
+            CategoryBudgetSnapshot(
+                id: row.id,
+                budgetedMinor: row.budgeted,
+                spentMinor: row.spent < 0 ? abs(row.spent) : row.spent
+            )
+        }
     }
 
     private func categoryGroupNameMap(month: String) async throws -> [String: String] {
