@@ -81,7 +81,7 @@ actor TransactionService {
             splits: splits
         )
 
-        let previousImpact = previousDraft.map(Self.currentMonthSpentImpact) ?? [:]
+        let previousImpact = previousDraft.map { Self.currentMonthSpentImpact(for: $0) } ?? [:]
         let nextImpact = Self.currentMonthSpentImpact(for: draft)
         let impactDelta = Self.delta(from: previousImpact, to: nextImpact)
         try await database.applyCategorySpentDeltas(impactDelta)
@@ -95,7 +95,7 @@ actor TransactionService {
 
     func deleteTransaction(_ item: RecentTransactionItem) async throws {
         let existingDraft = try await database.loadDraft(localID: item.id)
-        let existingImpact = existingDraft.map(Self.currentMonthSpentImpact) ?? [:]
+        let existingImpact = existingDraft.map { Self.currentMonthSpentImpact(for: $0) } ?? [:]
         try await database.deleteTransaction(localID: item.id)
 
         let payload = DeleteTransactionMutation(
@@ -120,7 +120,9 @@ actor TransactionService {
 
         try await database.enqueueMutation(mutation)
 
-        let reversed = Dictionary(uniqueKeysWithValues: existingImpact.map { ($0.key, -$0.value) })
+        let reversed: [String: Int64] = existingImpact.reduce(into: [:]) { partial, entry in
+            partial[entry.key] = -entry.value
+        }
         try await database.applyCategorySpentDeltas(reversed)
     }
 
