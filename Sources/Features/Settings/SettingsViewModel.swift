@@ -9,12 +9,41 @@ final class SettingsViewModel: ObservableObject {
     @Published var recentFilterMode: RecentFilterMode = .trackedOnly
     @Published var allCategories: [Category] = []
     @Published var selectedCategoryIDs: Set<String> = []
-    @Published var isSaving = false
     @Published var errorMessage: String?
-    @Published var confirmationMessage: String?
 
     private let configurationStore: AppConfigurationStore
     private let homeService: HomeService
+
+    private var hasLoadedInitialState = false
+    private var hasStartedLoading = false
+    private var autoSaveTask: Task<Void, Never>?
+    private var hasQueuedAutoSave = false
+    private var lastSavedConfig: ConfigSnapshot?
+    private var lastSavedTrackedCategoryIDs: [String] = []
+
+    private struct ConnectionSnapshot: Equatable {
+        let baseURL: String
+        let syncID: String
+        let apiKey: String
+        let budgetEncryptionPassword: String
+    }
+
+    private struct ConfigSnapshot: Equatable {
+        let baseURL: String
+        let syncID: String
+        let apiKey: String
+        let budgetEncryptionPassword: String
+        let recentFilterMode: RecentFilterMode
+
+        var connection: ConnectionSnapshot {
+            ConnectionSnapshot(
+                baseURL: baseURL,
+                syncID: syncID,
+                apiKey: apiKey,
+                budgetEncryptionPassword: budgetEncryptionPassword
+            )
+        }
+    }
 
     init(configurationStore: AppConfigurationStore, homeService: HomeService) {
         self.configurationStore = configurationStore
@@ -22,6 +51,9 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func onAppear() {
+        guard !hasStartedLoading else { return }
+        hasStartedLoading = true
+
         Task {
             do {
                 let state = try await configurationStore.loadViewModelState()
@@ -32,76 +64,118 @@ final class SettingsViewModel: ObservableObject {
                 recentFilterMode = state.recentFilterMode
 
                 allCategories = try await homeService.fetchAllCategories()
-                selectedCategoryIDs = Set(try await homeService.loadTrackedCategoryIDs())
+                let trackedCategoryIDs = try await homeService.loadTrackedCategoryIDs()
+                selectedCategoryIDs = Set(trackedCategoryIDs)
+
+                lastSavedConfig = currentConfigSnapshot()
+                lastSavedTrackedCategoryIDs = trackedCategoryIDs
+                hasLoadedInitialState = true
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
     }
 
-    func toggleCategory(_ id: String) {
+    func toggleCategoryAndAutoSave(_ id: String) {
         if selectedCategoryIDs.contains(id) {
             selectedCategoryIDs.remove(id)
         } else {
             selectedCategoryIDs.insert(id)
         }
+        enqueueAutoSave()
     }
 
-    func save() {
-        isSaving = true
-        errorMessage = nil
-        confirmationMessage = nil
+    func triggerAutoSaveFromFieldBlur() {
+        enqueueAutoSave()
+    }
 
-        Task {
-            defer { isSaving = false }
-            do {
-                try await configurationStore.save(
-                    baseURL: baseURL,
-                    syncID: syncID,
-                    apiKey: apiKey,
-                    encryptionPassword: budgetEncryptionPassword,
-                    recentFilterMode: recentFilterMode
-                )
+    func triggerAutoSaveFromControlChange() {
+        enqueueAutoSave()
+    }
 
-                // Refresh lookups from server after credentials/config are saved.
-                let outcome = try await homeService.refresh()
-                allCategories = try await homeService.fetchAllCategories()
+    private func enqueueAutoSave() {
+        guard hasLoadedInitialState else { return }
+        hasQueuedAutoSave = true
+        guard autoSaveTask == nil else { return }
 
-                // First save should allow connection details to persist even before tracked categories are selected.
-                guard !allCategories.isEmpty else {
-                    if let warning = outcome.warningMessage {
-                        confirmationMessage = "Connection saved. \(warning)"
-                    } else {
-                        confirmationMessage = "Connection saved. Sync categories, then pick 5-8 tracked categories."
-                    }
-                    return
-                }
-
-                guard (5...8).contains(selectedCategoryIDs.count) else {
-                    if let warning = outcome.warningMessage {
-                        confirmationMessage = "Connection saved. \(warning)"
-                    } else {
-                        confirmationMessage = "Connection saved. Select 5-8 tracked categories, then save again."
-                    }
-                    return
-                }
-
-                let ordered = allCategories
-                    .filter { selectedCategoryIDs.contains($0.id) }
-                    .map(\.id)
-                try await homeService.saveTrackedCategoryIDs(ordered)
-                if let warning = outcome.warningMessage {
-                    confirmationMessage = "Settings saved. \(warning)"
-                } else {
-                    confirmationMessage = "Settings saved"
-                }
-            } catch {
-                if Self.isCancellation(error) {
-                    return
-                }
-                errorMessage = error.localizedDescription
-            }
+        autoSaveTask = Task { @MainActor [weak self] in
+            await self?.runAutoSaveLoop()
         }
+    }
+
+    private func runAutoSaveLoop() async {
+        while hasQueuedAutoSave {
+            hasQueuedAutoSave = false
+            await persistPendingChangesIfNeeded()
+        }
+        autoSaveTask = nil
+    }
+
+    private func persistPendingChangesIfNeeded() async {
+        let currentConfig = currentConfigSnapshot()
+        let configChanged = currentConfig != lastSavedConfig
+        let connectionChanged = currentConfig.connection != lastSavedConfig?.connection
+        let currentTrackedCategoryIDs = orderedTrackedCategoryIDs()
+        let trackedChanged = currentTrackedCategoryIDs != lastSavedTrackedCategoryIDs
+
+        guard configChanged || trackedChanged else { return }
+        errorMessage = nil
+
+        do {
+            if configChanged, canPersistConfig(currentConfig) {
+                try await configurationStore.save(
+                    baseURL: currentConfig.baseURL,
+                    syncID: currentConfig.syncID,
+                    apiKey: currentConfig.apiKey,
+                    encryptionPassword: currentConfig.budgetEncryptionPassword,
+                    recentFilterMode: currentConfig.recentFilterMode
+                )
+                lastSavedConfig = currentConfig
+
+                if connectionChanged {
+                    _ = try await homeService.refresh()
+                    allCategories = try await homeService.fetchAllCategories()
+                }
+            }
+
+            if !allCategories.isEmpty {
+                let trackedCategoryIDsAfterRefresh = orderedTrackedCategoryIDs()
+                if trackedCategoryIDsAfterRefresh != lastSavedTrackedCategoryIDs {
+                    try await homeService.saveTrackedCategoryIDs(trackedCategoryIDsAfterRefresh)
+                    lastSavedTrackedCategoryIDs = trackedCategoryIDsAfterRefresh
+                }
+            }
+        } catch {
+            if Self.isCancellation(error) {
+                return
+            }
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func currentConfigSnapshot() -> ConfigSnapshot {
+        ConfigSnapshot(
+            baseURL: baseURL.components(separatedBy: .whitespacesAndNewlines).joined(),
+            syncID: syncID.components(separatedBy: .whitespacesAndNewlines).joined(),
+            apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+            budgetEncryptionPassword: budgetEncryptionPassword.trimmingCharacters(in: .whitespacesAndNewlines),
+            recentFilterMode: recentFilterMode
+        )
+    }
+
+    private func canPersistConfig(_ config: ConfigSnapshot) -> Bool {
+        guard !config.syncID.isEmpty else { return false }
+        guard !config.apiKey.isEmpty else { return false }
+        guard let url = URL(string: config.baseURL), url.scheme?.lowercased() == "https" else {
+            return false
+        }
+        return true
+    }
+
+    private func orderedTrackedCategoryIDs() -> [String] {
+        allCategories
+            .filter { selectedCategoryIDs.contains($0.id) }
+            .map(\.id)
     }
 
     private static func isCancellation(_ error: Error) -> Bool {

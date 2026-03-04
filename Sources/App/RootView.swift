@@ -2,7 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @ObservedObject var container: AppContainer
-    @State private var selectedTab: AppTab = .home
+    @State private var isShowingSettings = false
 
     var body: some View {
         Group {
@@ -21,17 +21,17 @@ struct RootView: View {
 
     @ViewBuilder
     private func contentView(dependencies: AppContainer.Dependencies) -> some View {
-        switch selectedTab {
-        case .home:
-            HomeView(
-                viewModel: HomeViewModel(homeService: dependencies.homeService, transactionService: dependencies.transactionService),
-                transactionService: dependencies.transactionService,
-                onOpenSettings: { selectedTab = .settings }
-            )
-        case .settings:
+        HomeView(
+            viewModel: HomeViewModel(homeService: dependencies.homeService, transactionService: dependencies.transactionService),
+            transactionService: dependencies.transactionService,
+            onOpenSettings: { isShowingSettings = true }
+        )
+        .sheet(isPresented: $isShowingSettings) {
             SettingsView(
-                viewModel: SettingsViewModel(configurationStore: dependencies.configurationStore, homeService: dependencies.homeService),
-                onOpenHome: { selectedTab = .home }
+                viewModel: SettingsViewModel(
+                    configurationStore: dependencies.configurationStore,
+                    homeService: dependencies.homeService
+                )
             )
         }
     }
@@ -61,9 +61,4 @@ struct RootView: View {
         }
         .padding(24)
     }
-}
-
-private enum AppTab {
-    case home
-    case settings
 }

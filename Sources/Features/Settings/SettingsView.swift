@@ -2,11 +2,17 @@ import SwiftUI
 
 struct SettingsView: View {
     @StateObject private var viewModel: SettingsViewModel
-    private let onOpenHome: () -> Void
+    @FocusState private var focusedField: Field?
 
-    init(viewModel: SettingsViewModel, onOpenHome: @escaping () -> Void) {
+    init(viewModel: SettingsViewModel) {
         _viewModel = StateObject(wrappedValue: viewModel)
-        self.onOpenHome = onOpenHome
+    }
+
+    private enum Field: Hashable {
+        case baseURL
+        case syncID
+        case apiKey
+        case budgetEncryptionPassword
     }
 
     var body: some View {
@@ -17,11 +23,15 @@ struct SettingsView: View {
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .focused($focusedField, equals: .baseURL)
                     TextField("Sync ID", text: $viewModel.syncID)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .focused($focusedField, equals: .syncID)
                     SecureField("API Key", text: $viewModel.apiKey)
+                        .focused($focusedField, equals: .apiKey)
                     SecureField("Budget Encryption Password (optional)", text: $viewModel.budgetEncryptionPassword)
+                        .focused($focusedField, equals: .budgetEncryptionPassword)
                 }
 
                 Section("Home Recent Filter") {
@@ -30,11 +40,14 @@ struct SettingsView: View {
                         Text("All").tag(RecentFilterMode.all)
                     }
                     .pickerStyle(.segmented)
+                    .onChange(of: viewModel.recentFilterMode, initial: false) { _, _ in
+                        viewModel.triggerAutoSaveFromControlChange()
+                    }
                 }
 
-                Section("Tracked Categories (5-8)") {
+                Section("Tracked Categories") {
                     if viewModel.allCategories.isEmpty {
-                        Text("Save server settings first to load categories.")
+                        Text("Enter server settings to load categories.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -45,7 +58,7 @@ struct SettingsView: View {
 
                     ForEach(viewModel.allCategories) { category in
                         Button {
-                            viewModel.toggleCategory(category.id)
+                            viewModel.toggleCategoryAndAutoSave(category.id)
                         } label: {
                             HStack {
                                 Text(category.name)
@@ -59,27 +72,19 @@ struct SettingsView: View {
                         .buttonStyle(.plain)
                     }
                 }
-
-                Section {
-                    Button("Save Settings") {
-                        viewModel.save()
-                    }
-                    .disabled(viewModel.isSaving)
-                }
             }
             .navigationTitle("Settings")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        onOpenHome()
-                    } label: {
-                        Image(systemName: "house")
-                    }
-                    .controlSize(.small)
+            .navigationBarTitleDisplayMode(.inline)
+            .onChange(of: focusedField, initial: false) { oldValue, newValue in
+                if oldValue != nil, oldValue != newValue {
+                    viewModel.triggerAutoSaveFromFieldBlur()
                 }
             }
             .onAppear {
                 viewModel.onAppear()
+            }
+            .onDisappear {
+                viewModel.triggerAutoSaveFromFieldBlur()
             }
             .alert("Error", isPresented: Binding(
                 get: { viewModel.errorMessage != nil },
@@ -88,22 +93,6 @@ struct SettingsView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(viewModel.errorMessage ?? "")
-            }
-            .overlay(alignment: .bottom) {
-                if let confirmationMessage = viewModel.confirmationMessage {
-                    Text(confirmationMessage)
-                        .font(.footnote.weight(.semibold))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.green.opacity(0.9), in: Capsule())
-                        .foregroundStyle(.white)
-                        .padding(.bottom, 12)
-                        .onAppear {
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                                viewModel.confirmationMessage = nil
-                            }
-                        }
-                }
             }
         }
     }
