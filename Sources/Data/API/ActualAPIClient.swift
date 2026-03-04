@@ -6,7 +6,12 @@ protocol ActualAPIClientProtocol: Sendable {
     func fetchPayees() async throws -> [Payee]
     func fetchCategories() async throws -> [CategorySyncPayload]
     func fetchCategoryBudgetSnapshots(monthCandidates: [String]) async throws -> [CategoryBudgetSnapshot]
-    func fetchRecentTransactions(limit: Int, daysBack: Int, accountIDs: [String]?) async throws -> [RecentTransactionItem]
+    func fetchRecentTransactions(
+        limit: Int,
+        daysBack: Int,
+        accountIDs: [String]?,
+        allowPartialFailures: Bool
+    ) async throws -> [RecentTransactionItem]
     func createPayee(name: String) async throws -> Payee
     func createTransaction(payload: APICreateTransactionPayload) async throws -> APISavedTransaction
     func updateTransaction(id: String, payload: APIUpdateTransactionPayload) async throws -> APISavedTransaction
@@ -286,7 +291,12 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
         throw APIClientError.invalidResponse(details: "Unable to load month category budget snapshots")
     }
 
-    func fetchRecentTransactions(limit: Int, daysBack: Int, accountIDs: [String]?) async throws -> [RecentTransactionItem] {
+    func fetchRecentTransactions(
+        limit: Int,
+        daysBack: Int,
+        accountIDs: [String]?,
+        allowPartialFailures: Bool
+    ) async throws -> [RecentTransactionItem] {
         let accounts: [Account]
         if let accountIDs {
             let uniqueIDs = Self.uniquePreservingOrder(accountIDs)
@@ -326,10 +336,12 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
                 }
             }
         }
-        if allTransactions.isEmpty, !failures.isEmpty {
-            throw APIClientError.partialFailure(
-                details: "Recent transaction fetch failed for all accounts. \(failures.joined(separator: " | "))"
-            )
+        if !failures.isEmpty {
+            if !allowPartialFailures || allTransactions.isEmpty {
+                throw APIClientError.partialFailure(
+                    details: "Recent transaction fetch incomplete. \(failures.joined(separator: " | "))"
+                )
+            }
         }
 
         let deduped = Dictionary(grouping: allTransactions, by: \.id).compactMap { $0.value.first }

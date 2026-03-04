@@ -1,6 +1,11 @@
 import Foundation
 
 actor HomeService {
+    struct PendingSyncState: Sendable {
+        let pendingCount: Int
+        let nextAttemptAt: Date?
+    }
+
     private let database: DatabaseService
     private let syncEngine: SyncEngine
     private let transactionService: TransactionService
@@ -26,6 +31,14 @@ actor HomeService {
 
     func processQueueOnly() async throws {
         try await syncEngine.processPendingMutations()
+    }
+
+    func pendingSyncState() async throws -> PendingSyncState {
+        let state = try await database.pendingMutationRetryState()
+        return PendingSyncState(
+            pendingCount: state.pendingCount,
+            nextAttemptAt: state.nextAttemptAt
+        )
     }
 
     func deleteTransaction(_ item: RecentTransactionItem) async throws {

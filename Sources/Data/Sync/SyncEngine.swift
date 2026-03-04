@@ -61,8 +61,11 @@ actor SyncEngine {
                 let accountIDs = report.touchedAccountIDs.isEmpty ? nil : Array(report.touchedAccountIDs)
                 async let recentsWarning = refreshRecentTransactionsOnly(
                     limit: 60,
-                    daysBack: 60,
-                    accountIDs: accountIDs
+                    daysBack: 62,
+                    accountIDs: accountIDs,
+                    allowPartialFailures: true,
+                    pruneServerMissing: false,
+                    pruneMonthPrefixes: []
                 )
                 async let budgetsWarning = refreshCategoryBudgetsOnly(
                     monthCandidates: Self.budgetMonthCandidates(preferredMonths: report.touchedMonths)
@@ -121,8 +124,11 @@ actor SyncEngine {
 
         if let warning = try await refreshRecentTransactionsOnly(
             limit: 60,
-            daysBack: 60,
-            accountIDs: nil
+            daysBack: 62,
+            accountIDs: nil,
+            allowPartialFailures: false,
+            pruneServerMissing: true,
+            pruneMonthPrefixes: Self.recentMonthPrefixes()
         ) {
             warnings.append(warning)
         }
@@ -173,18 +179,31 @@ actor SyncEngine {
     private func refreshRecentTransactionsOnly(
         limit: Int,
         daysBack: Int,
-        accountIDs: [String]?
+        accountIDs: [String]?,
+        allowPartialFailures: Bool,
+        pruneServerMissing: Bool,
+        pruneMonthPrefixes: [String]
     ) async throws -> String? {
         do {
             async let pendingDeleteIDs = database.fetchPendingDeleteTransactionLocalIDs()
             let fetchedRecents = try await api.fetchRecentTransactions(
                 limit: limit,
                 daysBack: daysBack,
-                accountIDs: accountIDs
+                accountIDs: accountIDs,
+                allowPartialFailures: allowPartialFailures
             )
             let pendingDeletes = try await pendingDeleteIDs
             let filteredRecents = fetchedRecents.filter { !pendingDeletes.contains($0.id) }
             try await database.upsertRecentTransactions(filteredRecents)
+            if pruneServerMissing {
+                let keepRemoteIDs = Set(filteredRecents.compactMap(\.remoteID))
+                let protectedLocalIDs = try await database.fetchPendingMutationTransactionLocalIDs()
+                _ = try await database.pruneRemoteTransactions(
+                    monthPrefixes: pruneMonthPrefixes,
+                    keepRemoteIDs: keepRemoteIDs,
+                    protectedLocalIDs: protectedLocalIDs
+                )
+            }
             return nil
         } catch {
             return Self.softSyncWarning(prefix: "Recent transactions refresh skipped", error: error)
@@ -314,6 +333,10 @@ actor SyncEngine {
         let year = components.year ?? 1970
         let month = components.month ?? 1
         return String(format: "%04d-%02d", year, month)
+    }
+
+    private static func recentMonthPrefixes(calendar: Calendar = .current) -> [String] {
+        [monthString(offset: 0, calendar: calendar), monthString(offset: -1, calendar: calendar)]
     }
 
     private static func monthPrefix(dateString: String) -> String? {

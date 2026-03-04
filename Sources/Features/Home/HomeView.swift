@@ -54,10 +54,7 @@ struct HomeView: View {
                             Text("Plan*d")
                                 .font(.title3.weight(.bold))
                             Spacer()
-                            if viewModel.isSyncing {
-                                ProgressView()
-                                    .controlSize(.small)
-                            }
+                            syncStatusBadge
                             Button {
                                 onOpenSettings()
                             } label: {
@@ -419,6 +416,21 @@ struct HomeView: View {
 
     private var trackedBudgetsTotalRemaining: Int64 {
         viewModel.trackedStatuses.reduce(0) { $0 + $1.remainingMinor }
+    }
+
+    private var syncStatusBadge: some View {
+        HStack(spacing: 6) {
+            Image(systemName: viewModel.syncStatusIcon)
+                .font(.caption.weight(.semibold))
+            Text(viewModel.syncStatusText)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(viewModel.syncStatusIsActive ? Color.accentColor : .secondary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .accessibilityLabel("Sync status: \(viewModel.syncStatusText)")
     }
 
     private static func displayGroupName(_ raw: String?) -> String {

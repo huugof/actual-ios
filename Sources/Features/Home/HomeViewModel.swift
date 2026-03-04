@@ -10,6 +10,9 @@ final class HomeViewModel: ObservableObject {
     @Published private(set) var queuedCount: Int = 0
     @Published var isLoading = false
     @Published var isSyncing = false
+    @Published private(set) var syncStatusText: String = "Up to date"
+    @Published private(set) var syncStatusIcon: String = "checkmark.circle"
+    @Published private(set) var syncStatusIsActive: Bool = false
     @Published var errorMessage: String?
     @Published var syncWarningMessage: String?
     @Published var toast: UndoToast?
@@ -18,6 +21,8 @@ final class HomeViewModel: ObservableObject {
     private let transactionService: TransactionService
     private var isMutationSyncInFlight = false
     private var pendingMutationSyncRequest = false
+    private var pullSyncTask: Task<Void, Never>?
+    private var retryMutationTask: Task<Void, Never>?
 
     init(homeService: HomeService, transactionService: TransactionService) {
         self.homeService = homeService
@@ -41,26 +46,23 @@ final class HomeViewModel: ObservableObject {
             otherBudgetStatuses = snapshot.otherBudgetStatuses
             recents = snapshot.recents
             queuedCount = snapshot.queuedMutationCount
+            if !isSyncing {
+                updateIdleStatus()
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
     func refreshInBackground() async {
-        isSyncing = true
-        defer { isSyncing = false }
-        do {
-            let outcome = try await homeService.refreshFull()
-            syncWarningMessage = outcome.warningMessage
-            await loadSnapshot()
-        } catch {
-            if Self.isCancellation(error) {
-                return
-            }
-            errorMessage = error.localizedDescription
-            syncWarningMessage = nil
-            await loadSnapshot()
+        pullSyncTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.runPullSync()
         }
+        pullSyncTask = task
+        await task.value
+        pullSyncTask = nil
     }
 
     func loadCurrentMonthTransactions(categoryID: String) async throws -> [RecentTransactionItem] {
@@ -194,6 +196,11 @@ final class HomeViewModel: ObservableObject {
     }
 
     private func scheduleMutationSync() {
+        pullSyncTask?.cancel()
+        pullSyncTask = nil
+        retryMutationTask?.cancel()
+        retryMutationTask = nil
+
         if isMutationSyncInFlight {
             pendingMutationSyncRequest = true
             return
@@ -211,6 +218,11 @@ final class HomeViewModel: ObservableObject {
 
     private func runMutationSync() async {
         isSyncing = true
+        setSyncStatus(
+            text: "Pushing • \(max(queuedCount, 1))",
+            icon: "arrow.up.circle.fill",
+            active: true
+        )
         defer { isSyncing = false }
 
         do {
@@ -223,6 +235,117 @@ final class HomeViewModel: ObservableObject {
             syncWarningMessage = "Saved locally. Sync pending."
         }
         await loadSnapshot()
+        await scheduleRetryIfNeeded()
+    }
+
+    private func runPullSync() async {
+        isSyncing = true
+        setSyncStatus(
+            text: "Pulling • \(queuedCount)",
+            icon: "arrow.down.circle.fill",
+            active: true
+        )
+        defer { isSyncing = false }
+
+        do {
+            let outcome = try await homeService.refreshFull()
+            syncWarningMessage = outcome.warningMessage
+        } catch {
+            if Self.isCancellation(error) {
+                return
+            }
+            errorMessage = error.localizedDescription
+            syncWarningMessage = nil
+        }
+        await loadSnapshot()
+        await scheduleRetryIfNeeded()
+    }
+
+    private func scheduleRetryIfNeeded() async {
+        retryMutationTask?.cancel()
+        retryMutationTask = nil
+
+        do {
+            let state = try await homeService.pendingSyncState()
+            queuedCount = state.pendingCount
+
+            guard state.pendingCount > 0 else {
+                updateIdleStatus()
+                return
+            }
+
+            guard let nextAttemptAt = state.nextAttemptAt else {
+                setSyncStatus(
+                    text: "Queued • \(state.pendingCount)",
+                    icon: "tray.and.arrow.up.fill",
+                    active: true
+                )
+                return
+            }
+
+            var remaining = max(0, Int(ceil(nextAttemptAt.timeIntervalSinceNow)))
+            if remaining == 0 {
+                pendingMutationSyncRequest = true
+                scheduleMutationSync()
+                return
+            }
+
+            setSyncStatus(
+                text: "Retry in \(remaining)s • \(state.pendingCount)",
+                icon: "clock.arrow.circlepath",
+                active: true
+            )
+
+            retryMutationTask = Task { [weak self] in
+                guard let self else { return }
+                while remaining > 0 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if Task.isCancelled {
+                        return
+                    }
+                    remaining -= 1
+                    await MainActor.run {
+                        self.setSyncStatus(
+                            text: "Retry in \(remaining)s • \(state.pendingCount)",
+                            icon: "clock.arrow.circlepath",
+                            active: true
+                        )
+                    }
+                }
+                await MainActor.run {
+                    self.pendingMutationSyncRequest = true
+                    self.scheduleMutationSync()
+                }
+            }
+        } catch {
+            setSyncStatus(
+                text: "Sync status unavailable",
+                icon: "exclamationmark.triangle.fill",
+                active: true
+            )
+        }
+    }
+
+    private func updateIdleStatus() {
+        if queuedCount > 0 {
+            setSyncStatus(
+                text: "Queued • \(queuedCount)",
+                icon: "tray.and.arrow.up.fill",
+                active: true
+            )
+        } else {
+            setSyncStatus(
+                text: "Up to date",
+                icon: "checkmark.circle",
+                active: false
+            )
+        }
+    }
+
+    private func setSyncStatus(text: String, icon: String, active: Bool) {
+        syncStatusText = text
+        syncStatusIcon = icon
+        syncStatusIsActive = active
     }
 }
 

@@ -524,8 +524,17 @@ actor DatabaseService {
     func upsertRecentTransactions(_ transactions: [RecentTransactionItem]) async throws {
         try await dbQueue.write { db in
             for transaction in transactions {
+                var localID = transaction.id
+                if let remoteID = transaction.remoteID,
+                   let existingID = try UUID.fetchOne(
+                       db,
+                       sql: "SELECT id FROM transactions WHERE remoteID = ? LIMIT 1",
+                       arguments: [remoteID]
+                   ) {
+                    localID = existingID
+                }
                 let row = TransactionRow(
-                    id: transaction.id,
+                    id: localID,
                     remoteID: transaction.remoteID,
                     amountMinor: transaction.amountMinor,
                     payeeID: transaction.payeeID,
@@ -540,6 +549,36 @@ actor DatabaseService {
                 )
                 try row.save(db)
             }
+        }
+    }
+
+    func pruneRemoteTransactions(
+        monthPrefixes: [String],
+        keepRemoteIDs: Set<String>,
+        protectedLocalIDs: Set<UUID>
+    ) async throws -> Int {
+        let normalizedPrefixes = monthPrefixes
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !normalizedPrefixes.isEmpty else { return 0 }
+
+        return try await dbQueue.write { db in
+            let rows = try TransactionRow.fetchAll(db)
+            let stale = rows.filter { row in
+                guard let remoteID = row.remoteID, !remoteID.isEmpty else { return false }
+                if protectedLocalIDs.contains(row.id) { return false }
+                let inScope = normalizedPrefixes.contains { prefix in
+                    row.date.hasPrefix(prefix)
+                }
+                guard inScope else { return false }
+                return !keepRemoteIDs.contains(remoteID)
+            }
+
+            for row in stale {
+                try SplitLineRow.filter(Column("transactionID") == row.id).deleteAll(db)
+                _ = try TransactionRow.deleteOne(db, key: row.id)
+            }
+            return stale.count
         }
     }
 
@@ -646,6 +685,52 @@ actor DatabaseService {
     func pendingMutationCount() async throws -> Int {
         try await dbQueue.read { db in
             try PendingMutationRow.filter(Column("state") != PendingMutationState.failed.rawValue).fetchCount(db)
+        }
+    }
+
+    func pendingMutationRetryState() async throws -> (pendingCount: Int, nextAttemptAt: Date?) {
+        try await dbQueue.read { db in
+            let pendingCount = try PendingMutationRow
+                .filter(Column("state") != PendingMutationState.failed.rawValue)
+                .fetchCount(db)
+            let nextAttemptAt = try Date.fetchOne(
+                db,
+                sql: """
+                    SELECT MIN(nextAttemptAt)
+                    FROM pending_mutations
+                    WHERE state = ?
+                """,
+                arguments: [PendingMutationState.queued.rawValue]
+            )
+            return (pendingCount, nextAttemptAt)
+        }
+    }
+
+    func fetchPendingMutationTransactionLocalIDs(
+        states: [PendingMutationState] = [.queued, .syncing]
+    ) async throws -> Set<UUID> {
+        let rawStates = states.map(\.rawValue)
+        guard !rawStates.isEmpty else { return [] }
+        let placeholders = Array(repeating: "?", count: rawStates.count).joined(separator: ",")
+        return try await dbQueue.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT transactionLocalID
+                    FROM pending_mutations
+                    WHERE state IN (\(placeholders))
+                      AND transactionLocalID IS NOT NULL
+                """,
+                arguments: StatementArguments(rawStates)
+            )
+            var ids = Set<UUID>()
+            for row in rows {
+                let value: DatabaseValue = row["transactionLocalID"]
+                if let id = DatabaseService.uuidFromDatabaseValue(value) {
+                    ids.insert(id)
+                }
+            }
+            return ids
         }
     }
 

@@ -18,7 +18,8 @@ final class SyncEngineModeTests: XCTestCase {
         XCTAssertEqual(stats.fetchBudgetSnapshotRequests.count, 1)
         XCTAssertEqual(stats.updateTransactionCount, 1)
         XCTAssertEqual(Set(stats.fetchRecentRequests[0].accountIDs ?? []), Set(["acct-1"]))
-        XCTAssertEqual(stats.fetchRecentRequests[0].daysBack, 60)
+        XCTAssertEqual(stats.fetchRecentRequests[0].daysBack, 62)
+        XCTAssertTrue(stats.fetchRecentRequests[0].allowPartialFailures)
     }
 
     func testMutationFastPassesTouchedMonthCandidates() async throws {
@@ -51,6 +52,7 @@ final class SyncEngineModeTests: XCTestCase {
         XCTAssertEqual(stats.fetchPayeesCount, 1)
         XCTAssertEqual(stats.fetchRecentRequests.count, 1)
         XCTAssertEqual(stats.fetchBudgetSnapshotRequests.count, 0)
+        XCTAssertFalse(stats.fetchRecentRequests[0].allowPartialFailures)
     }
 
     func testMutationDrainProcessesMoreThanOneBatch() async throws {
@@ -251,6 +253,7 @@ private struct RecentRequest: Sendable {
     let limit: Int
     let daysBack: Int
     let accountIDs: [String]?
+    let allowPartialFailures: Bool
 }
 
 private struct MockStats: Sendable {
@@ -303,9 +306,19 @@ private actor MockAPIClient: ActualAPIClientProtocol {
         return fetchCategoriesResponse
     }
 
-    func fetchRecentTransactions(limit: Int, daysBack: Int, accountIDs: [String]?) async throws -> [RecentTransactionItem] {
+    func fetchRecentTransactions(
+        limit: Int,
+        daysBack: Int,
+        accountIDs: [String]?,
+        allowPartialFailures: Bool
+    ) async throws -> [RecentTransactionItem] {
         stats.fetchRecentRequests.append(
-            RecentRequest(limit: limit, daysBack: daysBack, accountIDs: accountIDs)
+            RecentRequest(
+                limit: limit,
+                daysBack: daysBack,
+                accountIDs: accountIDs,
+                allowPartialFailures: allowPartialFailures
+            )
         )
         return []
     }
