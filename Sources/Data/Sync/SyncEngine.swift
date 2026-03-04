@@ -14,6 +14,7 @@ struct MutationProcessingReport: Sendable {
     var processedCount: Int = 0
     var processedTransactionMutation = false
     var touchedAccountIDs: Set<String> = []
+    var touchedMonths: [String] = []
 
     mutating func record(_ result: MutationApplyResult) {
         processedCount += 1
@@ -23,12 +24,16 @@ struct MutationProcessingReport: Sendable {
         if let accountID = result.touchedAccountID, !accountID.isEmpty {
             touchedAccountIDs.insert(accountID)
         }
+        if let touchedMonth = result.touchedMonth, !touchedMonth.isEmpty, !touchedMonths.contains(touchedMonth) {
+            touchedMonths.append(touchedMonth)
+        }
     }
 }
 
 struct MutationApplyResult: Sendable {
     let isTransactionMutation: Bool
     let touchedAccountID: String?
+    let touchedMonth: String?
 }
 
 actor SyncEngine {
@@ -60,7 +65,7 @@ actor SyncEngine {
                     accountIDs: accountIDs
                 )
                 async let budgetsWarning = refreshCategoryBudgetsOnly(
-                    monthCandidates: Self.budgetMonthCandidates()
+                    monthCandidates: Self.budgetMonthCandidates(preferredMonths: report.touchedMonths)
                 )
 
                 if let warning = try await recentsWarning {
@@ -191,8 +196,23 @@ actor SyncEngine {
             let snapshots = try await api.fetchCategoryBudgetSnapshots(monthCandidates: monthCandidates)
             try await database.applyCategoryBudgetSnapshots(snapshots)
             return nil
-        } catch {
-            return Self.softSyncWarning(prefix: "Category budget refresh skipped", error: error)
+        } catch let error where Self.shouldIgnoreSoftError(error) {
+            return nil
+        } catch let snapshotError {
+            do {
+                let fetchedCategories = try await api.fetchCategories()
+                try await database.upsertCategories(fetchedCategories)
+                return nil
+            } catch let fallbackError {
+                var warnings: [String] = []
+                if let warning = Self.softSyncWarning(prefix: "Category budget refresh skipped", error: snapshotError) {
+                    warnings.append(warning)
+                }
+                if let warning = Self.softSyncWarning(prefix: "Fallback category refresh failed", error: fallbackError) {
+                    warnings.append(warning)
+                }
+                return warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+            }
         }
     }
 
@@ -210,7 +230,8 @@ actor SyncEngine {
             }
             return MutationApplyResult(
                 isTransactionMutation: true,
-                touchedAccountID: envelope.data.payload.accountID
+                touchedAccountID: envelope.data.payload.accountID,
+                touchedMonth: Self.monthPrefix(dateString: envelope.data.payload.date)
             )
 
         case .updateTransaction:
@@ -218,7 +239,8 @@ actor SyncEngine {
             _ = try await api.updateTransaction(id: envelope.data.remoteTransactionID, payload: envelope.data.payload)
             return MutationApplyResult(
                 isTransactionMutation: true,
-                touchedAccountID: envelope.data.payload.accountID
+                touchedAccountID: envelope.data.payload.accountID,
+                touchedMonth: Self.monthPrefix(dateString: envelope.data.payload.date)
             )
 
         case .deleteTransaction:
@@ -233,14 +255,15 @@ actor SyncEngine {
             try await database.deleteTransaction(localID: envelope.data.localTransactionID)
             return MutationApplyResult(
                 isTransactionMutation: true,
-                touchedAccountID: envelope.data.accountID
+                touchedAccountID: envelope.data.accountID,
+                touchedMonth: nil
             )
 
         case .createPayee:
             let envelope = try JSONDecoder().decode(MutationEnvelope<CreatePayeeMutation>.self, from: mutation.payload)
             let payee = try await api.createPayee(name: envelope.data.proposedName)
             try await database.upsertPayee(payee)
-            return MutationApplyResult(isTransactionMutation: false, touchedAccountID: nil)
+            return MutationApplyResult(isTransactionMutation: false, touchedAccountID: nil, touchedMonth: nil)
         }
     }
 
@@ -258,13 +281,8 @@ actor SyncEngine {
     }
 
     private static func softSyncWarning(prefix: String, error: Error) -> String? {
-        if error is CancellationError {
+        if shouldIgnoreSoftError(error) {
             return nil
-        }
-        if let apiError = error as? APIClientError {
-            if case .requestCancelled = apiError {
-                return nil
-            }
         }
         if let apiError = error as? APIClientError, let message = apiError.errorDescription {
             return "\(prefix): \(message)"
@@ -272,10 +290,22 @@ actor SyncEngine {
         return "\(prefix): \(error.localizedDescription)"
     }
 
-    private static func budgetMonthCandidates(calendar: Calendar = .current) -> [String] {
+    private static func shouldIgnoreSoftError(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let apiError = error as? APIClientError {
+            if case .requestCancelled = apiError {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func budgetMonthCandidates(preferredMonths: [String], calendar: Calendar = .current) -> [String] {
         let current = Self.monthString(offset: 0, calendar: calendar)
         let previous = Self.monthString(offset: -1, calendar: calendar)
-        return [current, previous]
+        return uniquePreservingOrder(preferredMonths + [current, previous])
     }
 
     private static func monthString(offset: Int, calendar: Calendar) -> String {
@@ -284,5 +314,26 @@ actor SyncEngine {
         let year = components.year ?? 1970
         let month = components.month ?? 1
         return String(format: "%04d-%02d", year, month)
+    }
+
+    private static func monthPrefix(dateString: String) -> String? {
+        let trimmed = dateString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 7 else { return nil }
+        let prefix = String(trimmed.prefix(7))
+        guard prefix.range(of: #"^\d{4}-\d{2}$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        return prefix
+    }
+
+    private static func uniquePreservingOrder(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var output: [String] = []
+        for value in values where !value.isEmpty {
+            if seen.insert(value).inserted {
+                output.append(value)
+            }
+        }
+        return output
     }
 }

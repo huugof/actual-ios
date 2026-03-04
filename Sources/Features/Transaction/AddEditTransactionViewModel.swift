@@ -102,7 +102,7 @@ final class AddEditTransactionViewModel: ObservableObject {
             do {
                 accounts = try await service.fetchAccounts()
                 trackedQuickCategories = try await service.fetchTrackedCategories()
-                allCategories = try await service.searchCategories(query: "", trackedOnly: false)
+                allCategories = try await service.fetchAllCategories()
                     .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
                 if case .edit(let existingID) = mode {
                     try await preload(existingID: existingID)

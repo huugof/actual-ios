@@ -15,6 +15,10 @@ actor TransactionService {
         try await database.fetchTrackedCategories()
     }
 
+    func fetchAllCategories() async throws -> [Category] {
+        try await database.fetchAllCategories()
+    }
+
     func searchPayees(query: String) async throws -> [Payee] {
         try await database.searchPayees(query: query)
     }
@@ -40,13 +44,20 @@ actor TransactionService {
             throw NSError(domain: "TransactionService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Transaction form is incomplete"])
         }
 
+        let previousDraft: TransactionDraft?
+        if let localID = draft.localID {
+            previousDraft = try await database.loadDraft(localID: localID)
+        } else {
+            previousDraft = nil
+        }
+
         let categoryIDs = extractCategoryIDs(mode: draft.categoryMode)
         let categoryNames = try await database.categoryNames(ids: categoryIDs)
         let categorySummary = buildCategorySummary(mode: draft.categoryMode, names: categoryNames)
 
         let payeeName = switch draft.payee {
         case .existing(let id):
-            (try await database.payeeName(id: id)) ?? "Unknown"
+            (try await database.payeeName(id: id)) ?? id
         case .new(let name):
             name
         case .none:
@@ -70,6 +81,11 @@ actor TransactionService {
             splits: splits
         )
 
+        let previousImpact = previousDraft.map(Self.currentMonthSpentImpact) ?? [:]
+        let nextImpact = Self.currentMonthSpentImpact(for: draft)
+        let impactDelta = Self.delta(from: previousImpact, to: nextImpact)
+        try await database.applyCategorySpentDeltas(impactDelta)
+
         let mutation = try buildMutation(for: draft, localID: localID)
         try await database.enqueueMutation(mutation)
         try await database.touchPayeeLastUsed(payeeID: existingPayeeID(from: draft.payee))
@@ -78,6 +94,8 @@ actor TransactionService {
     }
 
     func deleteTransaction(_ item: RecentTransactionItem) async throws {
+        let existingDraft = try await database.loadDraft(localID: item.id)
+        let existingImpact = existingDraft.map(Self.currentMonthSpentImpact) ?? [:]
         try await database.deleteTransaction(localID: item.id)
 
         let payload = DeleteTransactionMutation(
@@ -101,6 +119,9 @@ actor TransactionService {
         )
 
         try await database.enqueueMutation(mutation)
+
+        let reversed = Dictionary(uniqueKeysWithValues: existingImpact.map { ($0.key, -$0.value) })
+        try await database.applyCategorySpentDeltas(reversed)
     }
 
     private func existingPayeeID(from selection: PayeeSelection?) -> String? {
@@ -252,10 +273,60 @@ actor TransactionService {
     private func buildCategorySummary(mode: TransactionCategoryMode, names: [String: String]) -> String {
         switch mode {
         case .single(let categoryID):
-            return names[categoryID] ?? "Uncategorized"
+            return names[categoryID] ?? categoryID
         case .split(let splits):
             let nameList = splits.compactMap { names[$0.categoryID] }
-            return nameList.isEmpty ? "Split" : "Split: " + nameList.prefix(2).joined(separator: ", ")
+            if !nameList.isEmpty {
+                return "Split: " + nameList.prefix(2).joined(separator: ", ")
+            }
+            let ids = splits.map(\.categoryID).filter { !$0.isEmpty }
+            return ids.isEmpty ? "Split" : "Split: " + ids.prefix(2).joined(separator: ", ")
         }
+    }
+
+    private static func delta(from old: [String: Int64], to new: [String: Int64]) -> [String: Int64] {
+        let keys = Set(old.keys).union(new.keys)
+        var merged: [String: Int64] = [:]
+        for id in keys {
+            let value = new[id, default: 0] - old[id, default: 0]
+            if value != 0 {
+                merged[id] = value
+            }
+        }
+        return merged
+    }
+
+    private static func currentMonthSpentImpact(for draft: TransactionDraft, calendar: Calendar = .current) -> [String: Int64] {
+        guard monthPrefix(from: draft.date.value) == currentMonthPrefix(calendar: calendar) else {
+            return [:]
+        }
+        switch draft.categoryMode {
+        case .single(let categoryID):
+            guard !categoryID.isEmpty else { return [:] }
+            return [categoryID: abs(draft.amountMinor)]
+        case .split(let splits):
+            var impact: [String: Int64] = [:]
+            for split in splits where !split.categoryID.isEmpty {
+                impact[split.categoryID, default: 0] += abs(split.amountMinor)
+            }
+            return impact
+        }
+    }
+
+    private static func monthPrefix(from rawDate: String) -> String? {
+        let trimmed = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 7 else { return nil }
+        let prefix = String(trimmed.prefix(7))
+        guard prefix.range(of: #"^\d{4}-\d{2}$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        return prefix
+    }
+
+    private static func currentMonthPrefix(calendar: Calendar = .current) -> String {
+        let components = calendar.dateComponents([.year, .month], from: .now)
+        let year = components.year ?? 1970
+        let month = components.month ?? 1
+        return String(format: "%04d-%02d", year, month)
     }
 }

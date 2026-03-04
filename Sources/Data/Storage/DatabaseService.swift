@@ -190,6 +190,24 @@ actor DatabaseService {
         }
     }
 
+    func applyCategorySpentDeltas(_ deltas: [String: Int64]) async throws {
+        guard !deltas.isEmpty else { return }
+        try await dbQueue.write { db in
+            for (categoryID, delta) in deltas where delta != 0 {
+                let current = try Int64.fetchOne(
+                    db,
+                    sql: "SELECT spentMinor FROM categories WHERE id = ?",
+                    arguments: [categoryID]
+                ) ?? 0
+                let next = max(0, current + delta)
+                try db.execute(
+                    sql: "UPDATE categories SET spentMinor = ?, updatedAt = ? WHERE id = ?",
+                    arguments: [next, Date.now, categoryID]
+                )
+            }
+        }
+    }
+
     func fetchAccounts() async throws -> [Account] {
         try await dbQueue.read { db in
             try AccountRow.order(Column("name")).fetchAll(db).map(\.domain)
@@ -264,6 +282,7 @@ actor DatabaseService {
             let trackedRows = try TrackedCategoryRow.order(Column("sortOrder")).fetchAll(db)
             let trackedIDs = trackedRows.map(\.categoryID)
 
+            let categoryRows = try CategoryRow.fetchAll(db)
             let allExpenseRows = try CategoryRow
                 .filter(Column("isIncome") == false)
                 .fetchAll(db)
@@ -272,6 +291,8 @@ actor DatabaseService {
                 spentMinor: allExpenseRows.reduce(0) { $0 + $1.spentMinor }
             )
             let categoryByID = Dictionary(uniqueKeysWithValues: allExpenseRows.map { ($0.id, $0) })
+            let categoryNameByID = Dictionary(uniqueKeysWithValues: categoryRows.map { ($0.id, $0.name) })
+            let payeeNameByID = Dictionary(uniqueKeysWithValues: try PayeeRow.fetchAll(db).map { ($0.id, $0.name) })
 
             let statuses: [CategoryBudgetStatus]
             if trackedIDs.isEmpty {
@@ -299,7 +320,13 @@ actor DatabaseService {
             if filterMode == .trackedOnly, !trackedIDs.isEmpty {
                 let all = try TransactionRow.order(Column("date").desc, Column("updatedAt").desc).fetchAll(db)
                 let filtered = all.filter { !trackedSet.isDisjoint(with: Set($0.categoryIDs)) }
-                let recents = Array(filtered.prefix(recentLimit)).map(\.domain)
+                let recents = Array(filtered.prefix(recentLimit)).map {
+                    Self.resolveRecent(
+                        row: $0,
+                        payeeNameByID: payeeNameByID,
+                        categoryNameByID: categoryNameByID
+                    )
+                }
                 let queuedCount = try PendingMutationRow.filter(Column("state") != PendingMutationState.failed.rawValue).fetchCount(db)
                 return HomeSnapshot(
                     trackedStatuses: statuses,
@@ -310,7 +337,13 @@ actor DatabaseService {
                 )
             }
 
-            let recents = try txRequest.fetchAll(db).map(\.domain)
+            let recents = try txRequest.fetchAll(db).map {
+                Self.resolveRecent(
+                    row: $0,
+                    payeeNameByID: payeeNameByID,
+                    categoryNameByID: categoryNameByID
+                )
+            }
             let queuedCount = try PendingMutationRow.filter(Column("state") != PendingMutationState.failed.rawValue).fetchCount(db)
             return HomeSnapshot(
                 trackedStatuses: statuses,
@@ -328,13 +361,21 @@ actor DatabaseService {
         limit: Int
     ) async throws -> [RecentTransactionItem] {
         try await dbQueue.read { db in
+            let payeeNameByID = Dictionary(uniqueKeysWithValues: try PayeeRow.fetchAll(db).map { ($0.id, $0.name) })
+            let categoryNameByID = Dictionary(uniqueKeysWithValues: try CategoryRow.fetchAll(db).map { ($0.id, $0.name) })
             let rows = try TransactionRow
                 .filter(Column("date").like("\(monthPrefix)%"))
                 .order(Column("date").desc, Column("updatedAt").desc)
                 .fetchAll(db)
 
             let filtered = rows.filter { $0.categoryIDs.contains(categoryID) }
-            return Array(filtered.prefix(limit)).map(\.domain)
+            return Array(filtered.prefix(limit)).map {
+                Self.resolveRecent(
+                    row: $0,
+                    payeeNameByID: payeeNameByID,
+                    categoryNameByID: categoryNameByID
+                )
+            }
         }
     }
 
@@ -657,5 +698,87 @@ actor DatabaseService {
             ))
         }
         return nil
+    }
+
+    nonisolated private static func resolveRecent(
+        row: TransactionRow,
+        payeeNameByID: [String: String],
+        categoryNameByID: [String: String]
+    ) -> RecentTransactionItem {
+        var item = row.domain
+        item.payeeName = resolvedPayeeName(row: row, payeeNameByID: payeeNameByID)
+        item.categorySummary = resolvedCategorySummary(row: row, categoryNameByID: categoryNameByID)
+        return item
+    }
+
+    nonisolated private static func resolvedPayeeName(
+        row: TransactionRow,
+        payeeNameByID: [String: String]
+    ) -> String {
+        if let payeeID = row.payeeID, let name = payeeNameByID[payeeID] {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return name
+            }
+        }
+
+        let stored = row.payeeName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stored.isEmpty, stored.caseInsensitiveCompare("unknown") != .orderedSame {
+            return row.payeeName
+        }
+
+        if let payeeID = row.payeeID {
+            let trimmed = payeeID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return payeeID
+            }
+        }
+
+        if !stored.isEmpty {
+            return row.payeeName
+        }
+        return "Unknown"
+    }
+
+    nonisolated private static func resolvedCategorySummary(
+        row: TransactionRow,
+        categoryNameByID: [String: String]
+    ) -> String {
+        let categoryIDs = row.categoryIDs
+        if row.isSplit {
+            let names = categoryIDs.compactMap { categoryNameByID[$0] }
+            if !names.isEmpty {
+                return "Split: " + names.prefix(2).joined(separator: ", ")
+            }
+            let stored = row.categorySummary.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !stored.isEmpty {
+                return row.categorySummary
+            }
+            return "Split"
+        }
+
+        if let firstID = categoryIDs.first, let name = categoryNameByID[firstID] {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return name
+            }
+        }
+
+        let stored = row.categorySummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stored.isEmpty, stored.caseInsensitiveCompare("uncategorized") != .orderedSame {
+            return row.categorySummary
+        }
+
+        if let firstID = categoryIDs.first {
+            let trimmed = firstID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return firstID
+            }
+        }
+
+        if !stored.isEmpty {
+            return row.categorySummary
+        }
+        return "Uncategorized"
     }
 }

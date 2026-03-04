@@ -21,6 +21,23 @@ final class SyncEngineModeTests: XCTestCase {
         XCTAssertEqual(stats.fetchRecentRequests[0].daysBack, 60)
     }
 
+    func testMutationFastPassesTouchedMonthCandidates() async throws {
+        let database = try makeDatabase()
+        let api = MockAPIClient()
+        let engine = SyncEngine(database: database, api: api)
+
+        try await enqueueUpdateMutation(
+            database: database,
+            accountID: "acct-1",
+            date: "2025-12-31"
+        )
+        _ = try await engine.sync(mode: .mutationFast)
+
+        let stats = await api.snapshot()
+        XCTAssertEqual(stats.fetchBudgetSnapshotRequests.count, 1)
+        XCTAssertTrue(stats.fetchBudgetSnapshotRequests[0].contains("2025-12"))
+    }
+
     func testFullSyncRunsSingleFullRefreshPass() async throws {
         let database = try makeDatabase()
         let api = MockAPIClient()
@@ -97,15 +114,93 @@ final class SyncEngineModeTests: XCTestCase {
         XCTAssertEqual(snapshot.overallBudget.spentMinor, 40_00)
     }
 
+    func testMutationFastFallsBackToFetchCategoriesWhenBudgetSnapshotFails() async throws {
+        let database = try makeDatabase()
+        let api = MockAPIClient()
+        await api.setBudgetSnapshotFailure(true)
+        await api.setFetchCategoriesResponse([
+            CategorySyncPayload(
+                id: "food",
+                name: "Food",
+                groupName: "Needs",
+                isIncome: false,
+                budgetedMinor: 100_00,
+                spentMinor: 55_00
+            )
+        ])
+        let engine = SyncEngine(database: database, api: api)
+
+        try await database.upsertCategories([
+            CategorySyncPayload(
+                id: "food",
+                name: "Food",
+                groupName: "Needs",
+                isIncome: false,
+                budgetedMinor: 100_00,
+                spentMinor: 0
+            )
+        ])
+        try await enqueueUpdateMutation(database: database, accountID: "acct-1")
+
+        _ = try await engine.sync(mode: .mutationFast)
+
+        let stats = await api.snapshot()
+        XCTAssertEqual(stats.fetchBudgetSnapshotRequests.count, 1)
+        XCTAssertEqual(stats.fetchCategoriesCount, 1)
+
+        let snapshot = try await database.fetchHomeSnapshot(filterMode: .all, recentLimit: 10)
+        XCTAssertEqual(snapshot.overallBudget.spentMinor, 55_00)
+    }
+
+    func testHomeSnapshotResolvesStaleRecentPayeeAndCategoryNames() async throws {
+        let database = try makeDatabase()
+
+        try await database.upsertPayees([
+            Payee(id: "payee-1", name: "Target", lastUsedAt: nil)
+        ])
+        try await database.upsertCategories([
+            CategorySyncPayload(
+                id: "clothes",
+                name: "Clothes",
+                groupName: "Living",
+                isIncome: false,
+                budgetedMinor: 100_00,
+                spentMinor: 0
+            )
+        ])
+
+        var draft = TransactionDraft()
+        draft.amountMinor = 20_00
+        draft.payee = .existing(id: "payee-1")
+        draft.accountID = "acct-1"
+        draft.date = LocalDate("2026-03-03")
+        draft.categoryMode = .single(categoryID: "clothes")
+        _ = try await database.saveTransaction(
+            draft: draft,
+            payeeName: "Unknown",
+            categorySummary: "Uncategorized",
+            categoryIDs: ["clothes"],
+            splits: []
+        )
+
+        let snapshot = try await database.fetchHomeSnapshot(filterMode: .all, recentLimit: 10)
+        XCTAssertEqual(snapshot.recents.first?.payeeName, "Target")
+        XCTAssertEqual(snapshot.recents.first?.categorySummary, "Clothes")
+    }
+
     private func makeDatabase() throws -> DatabaseService {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("actual-sync-tests-\(UUID().uuidString).sqlite")
         return try DatabaseService(path: url.path(percentEncoded: false))
     }
 
-    private func enqueueUpdateMutation(database: DatabaseService, accountID: String) async throws {
+    private func enqueueUpdateMutation(
+        database: DatabaseService,
+        accountID: String,
+        date: String = "2026-03-03"
+    ) async throws {
         let payload = APIUpdateTransactionPayload(
             accountID: accountID,
-            date: "2026-03-03",
+            date: date,
             amountMinor: -500,
             payeeID: nil,
             payeeName: nil,
@@ -173,10 +268,20 @@ private struct MockStats: Sendable {
 private actor MockAPIClient: ActualAPIClientProtocol {
     private var stats = MockStats()
     private var shouldFailUpdate = false
+    private var shouldFailBudgetSnapshot = false
+    private var fetchCategoriesResponse: [CategorySyncPayload] = []
     private var payeeCounter = 0
 
     func setUpdateFailure(_ value: Bool) {
         shouldFailUpdate = value
+    }
+
+    func setBudgetSnapshotFailure(_ value: Bool) {
+        shouldFailBudgetSnapshot = value
+    }
+
+    func setFetchCategoriesResponse(_ categories: [CategorySyncPayload]) {
+        fetchCategoriesResponse = categories
     }
 
     func snapshot() -> MockStats {
@@ -195,7 +300,7 @@ private actor MockAPIClient: ActualAPIClientProtocol {
 
     func fetchCategories() async throws -> [CategorySyncPayload] {
         stats.fetchCategoriesCount += 1
-        return []
+        return fetchCategoriesResponse
     }
 
     func fetchRecentTransactions(limit: Int, daysBack: Int, accountIDs: [String]?) async throws -> [RecentTransactionItem] {
@@ -207,6 +312,9 @@ private actor MockAPIClient: ActualAPIClientProtocol {
 
     func fetchCategoryBudgetSnapshots(monthCandidates: [String]) async throws -> [CategoryBudgetSnapshot] {
         stats.fetchBudgetSnapshotRequests.append(monthCandidates)
+        if shouldFailBudgetSnapshot {
+            throw APIClientError.networkError(details: "forced budget snapshot failure")
+        }
         return [
             CategoryBudgetSnapshot(id: "food", budgetedMinor: 100_00, spentMinor: 40_00)
         ]
