@@ -28,6 +28,7 @@ final class AddEditTransactionViewModel: ObservableObject {
     @Published private(set) var allCategories: [Category] = []
     @Published private(set) var categorySuggestions: [Category] = []
     @Published private(set) var splitCategoryTextByLineID: [UUID: String] = [:]
+    @Published private(set) var splitAmountTextByLineID: [UUID: String] = [:]
     @Published private(set) var splitCategorySuggestionsByLineID: [UUID: [Category]] = [:]
     @Published private(set) var canSave = false
     @Published var errorMessage: String?
@@ -45,8 +46,13 @@ final class AddEditTransactionViewModel: ObservableObject {
         mode.isNew
     }
 
+    var datePickerSelection: Date {
+        get { date.toDate() ?? .now }
+        set { date = LocalDate(date: newValue) }
+    }
+
     var splitRemainingMinor: Int64 {
-        let total = MoneyFormatter.parseToMinor(amountText) ?? 0
+        let total = MoneyFormatter.shiftedInputToMinor(amountText)
         let allocated = splitLines.reduce(0) { $0 + $1.amountMinor }
         return total - allocated
     }
@@ -121,7 +127,11 @@ final class AddEditTransactionViewModel: ObservableObject {
     }
 
     func updateAmount(_ value: String) {
-        amountText = value
+        if value.isEmpty {
+            amountText = ""
+        } else {
+            amountText = MoneyFormatter.normalizeShiftedCurrencyInput(value)
+        }
         updateCanSave()
     }
 
@@ -245,6 +255,7 @@ final class AddEditTransactionViewModel: ObservableObject {
         let line = TransactionSplit(id: UUID(), categoryID: "", amountMinor: 0)
         splitLines.append(line)
         splitCategoryTextByLineID[line.id] = ""
+        splitAmountTextByLineID[line.id] = ""
         splitCategorySuggestionsByLineID[line.id] = trackedQuickCategories
         updateCanSave()
     }
@@ -253,6 +264,7 @@ final class AddEditTransactionViewModel: ObservableObject {
         guard splitLines.count > 2 else { return }
         splitLines.removeAll { $0.id == id }
         splitCategoryTextByLineID[id] = nil
+        splitAmountTextByLineID[id] = nil
         splitCategorySuggestionsByLineID[id] = nil
         updateCanSave()
     }
@@ -265,6 +277,10 @@ final class AddEditTransactionViewModel: ObservableObject {
 
     func splitCategoryText(for lineID: UUID) -> String {
         splitCategoryTextByLineID[lineID] ?? ""
+    }
+
+    func splitAmountText(for lineID: UUID) -> String {
+        splitAmountTextByLineID[lineID] ?? ""
     }
 
     func splitSuggestions(for lineID: UUID) -> [Category] {
@@ -302,18 +318,26 @@ final class AddEditTransactionViewModel: ObservableObject {
 
     func updateSplitAmount(id: UUID, amountText: String) {
         guard let index = splitLines.firstIndex(where: { $0.id == id }) else { return }
-        splitLines[index].amountMinor = MoneyFormatter.parseToMinor(amountText) ?? 0
+        if amountText.isEmpty {
+            splitAmountTextByLineID[id] = ""
+            splitLines[index].amountMinor = 0
+        } else {
+            let normalized = MoneyFormatter.normalizeShiftedCurrencyInput(amountText)
+            splitAmountTextByLineID[id] = normalized
+            splitLines[index].amountMinor = MoneyFormatter.shiftedInputToMinor(normalized)
+        }
         updateCanSave()
     }
 
     func autoFillRemainder(targetID: UUID) {
-        guard let total = MoneyFormatter.parseToMinor(amountText) else { return }
+        let total = MoneyFormatter.shiftedInputToMinor(amountText)
         guard let index = splitLines.firstIndex(where: { $0.id == targetID }) else { return }
         let allocatedWithoutTarget = splitLines.enumerated().reduce(Int64(0)) { acc, pair in
             let (idx, line) = pair
             return idx == index ? acc : acc + line.amountMinor
         }
         splitLines[index].amountMinor = total - allocatedWithoutTarget
+        splitAmountTextByLineID[targetID] = MoneyFormatter.currencyInputText(minor: splitLines[index].amountMinor)
         updateCanSave()
     }
 
@@ -327,7 +351,7 @@ final class AddEditTransactionViewModel: ObservableObject {
             draft.remoteID = existingRemoteID
         }
 
-        draft.amountMinor = MoneyFormatter.parseToMinor(amountText) ?? 0
+        draft.amountMinor = MoneyFormatter.shiftedInputToMinor(amountText)
         draft.payee = selectedPayee ?? .new(name: payeeText)
         draft.accountID = selectedAccountID
         draft.date = date
@@ -349,7 +373,7 @@ final class AddEditTransactionViewModel: ObservableObject {
     private func preload(existingID: UUID) async throws {
         guard let draft = try await service.loadDraft(localID: existingID) else { return }
         existingRemoteID = draft.remoteID
-        amountText = MoneyFormatter.display(minor: draft.amountMinor).replacingOccurrences(of: Locale.current.currencySymbol ?? "$", with: "")
+        amountText = draft.amountMinor == 0 ? "" : MoneyFormatter.currencyInputText(minor: draft.amountMinor)
         selectedPayee = draft.payee
         payeeText = switch draft.payee {
         case .existing(let id):
@@ -360,7 +384,7 @@ final class AddEditTransactionViewModel: ObservableObject {
             ""
         }
         selectedAccountID = draft.accountID
-        date = draft.date
+        date = draft.date.toDate() == nil ? LocalDate() : draft.date
         note = draft.note
 
         switch draft.categoryMode {
@@ -373,9 +397,11 @@ final class AddEditTransactionViewModel: ObservableObject {
             isSplitMode = true
             splitLines = splits
             splitCategoryTextByLineID = [:]
+            splitAmountTextByLineID = [:]
             splitCategorySuggestionsByLineID = [:]
             for split in splits {
                 splitCategoryTextByLineID[split.id] = (try await service.categoryName(id: split.categoryID)) ?? split.categoryID
+                splitAmountTextByLineID[split.id] = split.amountMinor == 0 ? "" : MoneyFormatter.currencyInputText(minor: split.amountMinor)
                 splitCategorySuggestionsByLineID[split.id] = []
             }
         }
@@ -386,6 +412,9 @@ final class AddEditTransactionViewModel: ObservableObject {
             if splitCategoryTextByLineID[line.id] == nil {
                 splitCategoryTextByLineID[line.id] = ""
             }
+            if splitAmountTextByLineID[line.id] == nil {
+                splitAmountTextByLineID[line.id] = line.amountMinor == 0 ? "" : MoneyFormatter.currencyInputText(minor: line.amountMinor)
+            }
             if splitCategorySuggestionsByLineID[line.id] == nil {
                 splitCategorySuggestionsByLineID[line.id] = trackedQuickCategories
             }
@@ -393,7 +422,7 @@ final class AddEditTransactionViewModel: ObservableObject {
     }
 
     private func updateCanSave() {
-        let amount = MoneyFormatter.parseToMinor(amountText) ?? 0
+        let amount = MoneyFormatter.shiftedInputToMinor(amountText)
         let payee = selectedPayee ?? .new(name: payeeText)
         let draft = TransactionDraft(
             localID: nil,

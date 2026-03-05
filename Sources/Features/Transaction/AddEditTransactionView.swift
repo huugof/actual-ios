@@ -1,9 +1,12 @@
 import SwiftUI
+import UIKit
 
 struct AddEditTransactionView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var viewModel: AddEditTransactionViewModel
     @FocusState private var focusedField: Field?
+    @State private var isAmountFocused = false
+    @State private var didScheduleInitialAmountFocus = false
     private let onSaved: (UUID, Bool) -> Void
 
     enum Field {
@@ -67,13 +70,24 @@ struct AddEditTransactionView: View {
             }
             .onAppear {
                 viewModel.onAppear()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    focusedField = .amount
-                }
+                scheduleInitialAmountFocusIfNeeded()
             }
             .onChange(of: viewModel.selectedAccountID, initial: false) { _, _ in viewModel.recomputeValidation() }
             .onChange(of: viewModel.note, initial: false) { _, _ in viewModel.recomputeValidation() }
             .onChange(of: viewModel.date.value, initial: false) { _, _ in viewModel.recomputeValidation() }
+        }
+    }
+
+    private func scheduleInitialAmountFocusIfNeeded() {
+        guard !didScheduleInitialAmountFocus else { return }
+        didScheduleInitialAmountFocus = true
+        let delays: [TimeInterval] = [0, 0.1, 0.3, 0.6]
+        for delay in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                if focusedField == nil && !isAmountFocused {
+                    isAmountFocused = true
+                }
+            }
         }
     }
 
@@ -82,13 +96,11 @@ struct AddEditTransactionView: View {
             Text("Amount")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            TextField("0.00", text: Binding(
+            ShiftedCurrencyTextField(text: Binding(
                 get: { viewModel.amountText },
                 set: { viewModel.updateAmount($0) }
-            ))
-            .keyboardType(.decimalPad)
-            .focused($focusedField, equals: .amount)
-            .textFieldStyle(.roundedBorder)
+            ), placeholder: "0.00", isFocused: $isAmountFocused)
+            .frame(maxWidth: .infinity)
         }
     }
 
@@ -213,6 +225,7 @@ struct AddEditTransactionView: View {
                 SplitLineEditor(
                     line: line,
                     selectedCategoryName: viewModel.categoryDisplayName(for: line.categoryID),
+                    amountText: viewModel.splitAmountText(for: line.id),
                     trackedCategories: viewModel.trackedQuickCategories,
                     otherCategories: viewModel.nonTrackedCategories,
                     onCategorySelected: { viewModel.selectSplitCategory(lineID: line.id, category: $0) },
@@ -249,11 +262,13 @@ struct AddEditTransactionView: View {
             Text("Date")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            TextField("YYYY-MM-DD", text: Binding(
-                get: { viewModel.date.value },
-                set: { viewModel.date = LocalDate($0) }
-            ))
-            .textFieldStyle(.roundedBorder)
+            DatePicker("", selection: Binding(
+                get: { viewModel.datePickerSelection },
+                set: { viewModel.datePickerSelection = $0 }
+            ), displayedComponents: .date)
+                .datePickerStyle(.compact)
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -271,14 +286,13 @@ struct AddEditTransactionView: View {
 private struct SplitLineEditor: View {
     let line: TransactionSplit
     let selectedCategoryName: String
+    let amountText: String
     let trackedCategories: [Category]
     let otherCategories: [Category]
     let onCategorySelected: (Category) -> Void
     let onAmountChanged: (String) -> Void
     let onAutofill: () -> Void
     let onRemove: () -> Void
-
-    @State private var amountInput = ""
 
     var body: some View {
         VStack(spacing: 8) {
@@ -330,15 +344,11 @@ private struct SplitLineEditor: View {
             }
 
             HStack(spacing: 8) {
-                TextField("0.00", text: Binding(
-                    get: { amountInput.isEmpty ? MoneyFormatter.display(minor: line.amountMinor).replacingOccurrences(of: Locale.current.currencySymbol ?? "$", with: "") : amountInput },
-                    set: {
-                        amountInput = $0
-                        onAmountChanged($0)
-                    }
-                ))
-                .keyboardType(.decimalPad)
-                .textFieldStyle(.roundedBorder)
+                ShiftedCurrencyTextField(text: Binding(
+                    get: { amountText },
+                    set: { onAmountChanged($0) }
+                ), placeholder: "0.00")
+                .frame(maxWidth: .infinity)
 
                 Button("Remainder", action: onAutofill)
                     .buttonStyle(.bordered)
@@ -353,5 +363,75 @@ private struct SplitLineEditor: View {
         }
         .padding(10)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+private struct ShiftedCurrencyTextField: UIViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    var isFocused: Binding<Bool>? = nil
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, isFocused: isFocused)
+    }
+
+    func makeUIView(context: Context) -> UITextField {
+        let textField = UITextField(frame: .zero)
+        textField.borderStyle = .roundedRect
+        textField.keyboardType = .numberPad
+        textField.placeholder = placeholder
+        textField.text = text
+        textField.delegate = context.coordinator
+        textField.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
+        return textField
+    }
+
+    func updateUIView(_ uiView: UITextField, context: Context) {
+        if uiView.text != text {
+            uiView.text = text
+        }
+        uiView.placeholder = placeholder
+        if let isFocused {
+            if isFocused.wrappedValue, !uiView.isFirstResponder {
+                uiView.becomeFirstResponder()
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        private let text: Binding<String>
+        private var isFocused: Binding<Bool>?
+
+        init(text: Binding<String>, isFocused: Binding<Bool>?) {
+            self.text = text
+            self.isFocused = isFocused
+        }
+
+        @objc func editingChanged(_ textField: UITextField) {
+            let raw = textField.text ?? ""
+            let digitsOnly = raw.filter(\.isNumber)
+            let formatted = digitsOnly.isEmpty ? "" : MoneyFormatter.normalizeShiftedCurrencyInput(digitsOnly)
+            if textField.text != formatted {
+                textField.text = formatted
+            }
+            if text.wrappedValue != formatted {
+                text.wrappedValue = formatted
+            }
+            moveCursorToEnd(textField)
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            isFocused?.wrappedValue = true
+            moveCursorToEnd(textField)
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            isFocused?.wrappedValue = false
+        }
+
+        private func moveCursorToEnd(_ textField: UITextField) {
+            let end = textField.endOfDocument
+            textField.selectedTextRange = textField.textRange(from: end, to: end)
+        }
     }
 }

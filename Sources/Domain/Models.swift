@@ -18,6 +18,34 @@ struct LocalDate: Codable, Equatable, Hashable, Sendable, Comparable {
     static func < (lhs: LocalDate, rhs: LocalDate) -> Bool {
         lhs.value < rhs.value
     }
+
+    func toDate(calendar: Calendar = .current) -> Date? {
+        let parts = value.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              let year = Int(parts[0]),
+              let month = Int(parts[1]),
+              let day = Int(parts[2]),
+              (1...12).contains(month),
+              (1...31).contains(day) else {
+            return nil
+        }
+        var components = DateComponents()
+        components.calendar = calendar
+        components.year = year
+        components.month = month
+        components.day = day
+        components.hour = 12
+        guard let date = calendar.date(from: components) else {
+            return nil
+        }
+        let roundTripped = calendar.dateComponents([.year, .month, .day], from: date)
+        guard roundTripped.year == year,
+              roundTripped.month == month,
+              roundTripped.day == day else {
+            return nil
+        }
+        return date
+    }
 }
 
 struct Account: Codable, Equatable, Identifiable, Sendable {
