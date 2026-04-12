@@ -200,9 +200,9 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
         var monthGroupIDs: [String: String] = [:]
         var categoryGroupNamesByID: [String: String] = [:]
         let preferredMonth = try? await preferredBudgetMonth()
-        let monthCandidates = Self.uniquePreservingOrder(
+        let monthCandidates = DateHelpers.uniquePreservingOrder(
             Self.monthCandidates(from: preferredMonth)
-            + Self.monthCandidates(from: Self.currentMonthString())
+            + Self.monthCandidates(from: DateHelpers.currentMonthPrefix())
             + Self.recentMonthFallbacks(count: 3)
         )
 
@@ -275,11 +275,11 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
     }
 
     func fetchCategoryBudgetSnapshots(monthCandidates: [String]) async throws -> [CategoryBudgetSnapshot] {
-        let candidates = Self.uniquePreservingOrder(
+        let candidates = DateHelpers.uniquePreservingOrder(
             monthCandidates.flatMap { Self.monthCandidates(from: $0) }
         )
-        let fallbackCandidates = Self.uniquePreservingOrder(
-            candidates + [Self.currentMonthString()] + Self.recentMonthFallbacks(count: 2)
+        let fallbackCandidates = DateHelpers.uniquePreservingOrder(
+            candidates + [DateHelpers.currentMonthPrefix()] + Self.recentMonthFallbacks(count: 2)
         )
 
         var lastError: Error?
@@ -308,7 +308,7 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
     ) async throws -> [SyncedRecentTransactionItem] {
         let accounts: [Account]
         if let accountIDs {
-            let uniqueIDs = Self.uniquePreservingOrder(accountIDs)
+            let uniqueIDs = DateHelpers.uniquePreservingOrder(accountIDs)
             accounts = uniqueIDs.map { Account(id: $0, name: $0) }
         } else {
             accounts = try await fetchAccounts()
@@ -614,14 +614,6 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
         return String(format: "%04d-%02d-%02d", y, m, d)
     }
 
-    private static func currentMonthString() -> String {
-        let calendar = Calendar.current
-        let components = calendar.dateComponents([.year, .month], from: .now)
-        let y = components.year ?? 1970
-        let m = components.month ?? 1
-        return String(format: "%04d-%02d", y, m)
-    }
-
     private static func monthCandidates(from raw: String?) -> [String] {
         guard let raw else { return [] }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -643,38 +635,18 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
         return []
     }
 
-    private static func uniquePreservingOrder(_ values: [String]) -> [String] {
-        var seen = Set<String>()
-        var output: [String] = []
-        for value in values {
-            if seen.insert(value).inserted {
-                output.append(value)
-            }
-        }
-        return output
-    }
-
     private static func recentMonthFallbacks(count: Int) -> [String] {
         guard count > 0 else { return [] }
-        let calendar = Calendar.current
-        var result: [String] = []
-        for offset in 0..<count {
-            let date = calendar.date(byAdding: .month, value: -offset, to: .now) ?? .now
-            let components = calendar.dateComponents([.year, .month], from: date)
-            let y = components.year ?? 1970
-            let m = components.month ?? 1
-            result.append(String(format: "%04d-%02d", y, m))
-        }
-        return result
+        return (0..<count).map { DateHelpers.monthString(offset: -$0) }
     }
 
     private func preferredBudgetMonth() async throws -> String? {
         let data = try await request(path: "months", method: "GET")
         let rawMonths = try decodeList(BudgetMonthRef.self, from: data, context: "GET months").map(\.value)
-        let months = Self.uniquePreservingOrder(rawMonths.flatMap { Self.monthCandidates(from: $0) })
+        let months = DateHelpers.uniquePreservingOrder(rawMonths.flatMap { Self.monthCandidates(from: $0) })
         guard !months.isEmpty else { return nil }
 
-        let current = Self.currentMonthString()
+        let current = DateHelpers.currentMonthPrefix()
         if months.contains(current) {
             return current
         }
@@ -814,25 +786,7 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
     }
 
     private static func looksLikeOpaqueIdentifier(_ value: String) -> Bool {
-        if UUID(uuidString: value) != nil {
-            return true
-        }
-        let lower = value.lowercased()
-        if lower.contains(" ") {
-            return false
-        }
-        if lower.range(of: "^[a-f0-9]{16,}$", options: .regularExpression) != nil {
-            return true
-        }
-        if lower.range(of: "^[a-z0-9_-]{20,}$", options: .regularExpression) != nil {
-            return true
-        }
-        let letters = lower.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
-        let digits = lower.unicodeScalars.filter { CharacterSet.decimalDigits.contains($0) }.count
-        if lower.count >= 10 && letters > 0 && digits > 0 {
-            return true
-        }
-        return false
+        IdentifierHeuristics.looksLikeOpaqueIdentifier(value)
     }
 
     private static func describeError(_ error: Error) -> String {
@@ -1207,15 +1161,18 @@ private extension KeyedDecodingContainer {
 }
 
 private func parseISODate(_ input: String) -> Date? {
-    let withFractional = ISO8601DateFormatter()
-    withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let standard = ISO8601DateFormatter()
-    standard.formatOptions = [.withInternetDateTime]
-
-    for formatter in [withFractional, standard] {
+    for formatter in parseISODateFormatters {
         if let date = formatter.date(from: input) {
             return date
         }
     }
     return nil
 }
+
+nonisolated(unsafe) private let parseISODateFormatters: [ISO8601DateFormatter] = {
+    let withFractional = ISO8601DateFormatter()
+    withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let standard = ISO8601DateFormatter()
+    standard.formatOptions = [.withInternetDateTime]
+    return [withFractional, standard]
+}()

@@ -22,7 +22,11 @@ struct RootView: View {
     @ViewBuilder
     private func contentView(dependencies: AppContainer.Dependencies) -> some View {
         HomeView(
-            viewModel: HomeViewModel(homeService: dependencies.homeService, transactionService: dependencies.transactionService),
+            viewModel: HomeViewModel(
+                homeService: dependencies.homeService,
+                transactionService: dependencies.transactionService,
+                startupSyncNotice: dependencies.startupSyncNotice
+            ),
             transactionService: dependencies.transactionService,
             onOpenSettings: { isShowingSettings = true }
         )

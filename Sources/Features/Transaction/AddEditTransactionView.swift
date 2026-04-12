@@ -7,7 +7,7 @@ struct AddEditTransactionView: View {
     @FocusState private var focusedField: Field?
     @State private var isAmountFocused = false
     @State private var didScheduleInitialAmountFocus = false
-    private let onSaved: (UUID, Bool) -> Void
+    private let onSaved: (UUID, Bool, TransactionDraft?) -> Void
 
     enum Field {
         case amount
@@ -15,7 +15,7 @@ struct AddEditTransactionView: View {
         case category
     }
 
-    init(viewModel: AddEditTransactionViewModel, onSaved: @escaping (UUID, Bool) -> Void) {
+    init(viewModel: AddEditTransactionViewModel, onSaved: @escaping (UUID, Bool, TransactionDraft?) -> Void) {
         _viewModel = StateObject(wrappedValue: viewModel)
         self.onSaved = onSaved
     }
@@ -46,8 +46,9 @@ struct AddEditTransactionView: View {
                     Button("Save") {
                         Task {
                             do {
+                                let originalDraft = viewModel.originalDraft
                                 let localID = try await viewModel.save()
-                                onSaved(localID, viewModel.isNew)
+                                onSaved(localID, viewModel.isNew, originalDraft)
                                 dismiss()
                             } catch {
                                 viewModel.errorMessage = error.localizedDescription
@@ -190,7 +191,8 @@ struct AddEditTransactionView: View {
                     }
                 } label: {
                     HStack {
-                        Text(viewModel.categoryDisplayName(for: viewModel.selectedCategoryID).isEmpty ? "Select category" : viewModel.categoryDisplayName(for: viewModel.selectedCategoryID))
+                        let displayName = viewModel.categoryDisplayName(for: viewModel.selectedCategoryID)
+                        Text(displayName.isEmpty ? "Select category" : displayName)
                             .foregroundStyle(viewModel.selectedCategoryID.isEmpty ? .secondary : .primary)
                             .lineLimit(1)
                         Spacer()

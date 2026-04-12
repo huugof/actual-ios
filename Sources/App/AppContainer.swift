@@ -15,6 +15,7 @@ final class AppContainer: ObservableObject {
         let syncEngine: SyncEngine
         let transactionService: TransactionService
         let homeService: HomeService
+        let startupSyncNotice: String?
     }
 
     enum StartupState {
@@ -24,6 +25,7 @@ final class AppContainer: ObservableObject {
     }
 
     @Published private(set) var startupState: StartupState = .launching
+    private var startupTask: Task<Void, Never>?
 
     init() {
         start()
@@ -35,7 +37,8 @@ final class AppContainer: ObservableObject {
     }
 
     private func start() {
-        Task {
+        startupTask?.cancel()
+        startupTask = Task {
             let result = await Task.detached(priority: .userInitiated) {
                 do {
                     return AppStartupResult.success(try Self.buildDependencies())
@@ -46,7 +49,18 @@ final class AppContainer: ObservableObject {
 
             switch result {
             case .success(let dependencies):
-                startupState = .ready(dependencies)
+                let recoverySummary = await dependencies.syncEngine.recoverInterruptedMutations()
+                let hydrated = Dependencies(
+                    database: dependencies.database,
+                    keychain: dependencies.keychain,
+                    configurationStore: dependencies.configurationStore,
+                    apiClient: dependencies.apiClient,
+                    syncEngine: dependencies.syncEngine,
+                    transactionService: dependencies.transactionService,
+                    homeService: dependencies.homeService,
+                    startupSyncNotice: recoverySummary.notice
+                )
+                startupState = .ready(hydrated)
             case .failure(let message):
                 startupState = .failed(message: message)
             }
@@ -72,7 +86,8 @@ final class AppContainer: ObservableObject {
             apiClient: apiClient,
             syncEngine: syncEngine,
             transactionService: transactionService,
-            homeService: homeService
+            homeService: homeService,
+            startupSyncNotice: nil
         )
     }
 }

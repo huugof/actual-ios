@@ -75,6 +75,61 @@ final class TransactionServiceAmountSignTests: XCTestCase {
         XCTAssertEqual(snapshotAfterDelete.overallBudget.spentMinor, 0)
     }
 
+    func testUpsertCategoriesPrunesStaleCategoriesFromOverallBudgetAndTrackedSet() async throws {
+        let database = try makeDatabase()
+        let service = TransactionService(database: database)
+
+        try await database.upsertCategories([
+            CategorySyncPayload(id: "current", name: "Current", groupName: "Needs", isIncome: false, budgetedMinor: 100_00, spentMinor: 50_00),
+            CategorySyncPayload(id: "stale", name: "Stale", groupName: "Needs", isIncome: false, budgetedMinor: 110_00, spentMinor: 110_00)
+        ])
+        try await database.setTrackedCategoryIDs(["current", "stale"])
+
+        try await database.upsertCategories([
+            CategorySyncPayload(id: "current", name: "Current", groupName: "Needs", isIncome: false, budgetedMinor: 100_00, spentMinor: 50_00)
+        ])
+
+        let snapshot = try await database.fetchHomeSnapshot(filterMode: .all, recentLimit: 10)
+        XCTAssertEqual(snapshot.overallBudget.budgetedMinor, 100_00)
+        XCTAssertEqual(snapshot.overallBudget.spentMinor, 50_00)
+
+        let trackedIDs = try await database.fetchTrackedCategoryIDs()
+        XCTAssertEqual(trackedIDs, ["current"])
+
+        let categories = try await service.fetchAllCategories()
+        XCTAssertEqual(categories.map(\.id), ["current"])
+    }
+
+    func testPrunedCategoriesDoNotBreakRecentTransactionCategorySummary() async throws {
+        let database = try makeDatabase()
+
+        try await database.upsertCategories([
+            CategorySyncPayload(id: "legacy", name: "Legacy", groupName: "Old", isIncome: false, budgetedMinor: 110_00, spentMinor: 110_00)
+        ])
+
+        var draft = TransactionDraft()
+        draft.amountMinor = 11_00
+        draft.payee = .new(name: "Coffee")
+        draft.accountID = "acct-1"
+        draft.date = LocalDate("2026-03-10")
+        draft.categoryMode = .single(categoryID: "legacy")
+
+        _ = try await database.saveTransaction(
+            draft: draft,
+            payeeName: "Coffee",
+            categorySummary: "Legacy",
+            categoryIDs: ["legacy"],
+            splits: []
+        )
+
+        try await database.upsertCategories([])
+
+        let snapshot = try await database.fetchHomeSnapshot(filterMode: .all, recentLimit: 10)
+        XCTAssertEqual(snapshot.overallBudget.budgetedMinor, 0)
+        XCTAssertEqual(snapshot.overallBudget.spentMinor, 0)
+        XCTAssertEqual(snapshot.recents.first?.categorySummary, "Legacy")
+    }
+
     private func makeDatabase() throws -> DatabaseService {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("actual-transaction-tests-\(UUID().uuidString).sqlite")
         return try DatabaseService(path: url.path(percentEncoded: false))

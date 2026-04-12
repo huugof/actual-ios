@@ -1,12 +1,16 @@
 import Foundation
 
 enum MoneyFormatter {
-    static func display(minor: Int64, currencyCode: String = Locale.current.currency?.identifier ?? "USD") -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .currency
-        formatter.currencyCode = currencyCode
+    private static let displayFormatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.locale = .autoupdatingCurrent
+        return f
+    }()
+
+    static func display(minor: Int64) -> String {
         let value = NSDecimalNumber(value: Double(minor) / 100.0)
-        return formatter.string(from: value) ?? "\(Double(minor) / 100.0)"
+        return displayFormatter.string(from: value) ?? "\(Double(minor) / 100.0)"
     }
 
     static func currencyInputText(minor: Int64) -> String {
@@ -53,5 +57,20 @@ enum LookupRanker {
 
             return ll < rr
         }
+    }
+}
+
+enum IdentifierHeuristics {
+    /// Returns true when `value` looks like a machine-generated opaque identifier
+    /// rather than a human-readable name (UUID, long hex string, etc.).
+    static func looksLikeOpaqueIdentifier(_ value: String) -> Bool {
+        if UUID(uuidString: value) != nil { return true }
+        let lower = value.lowercased()
+        if lower.contains(" ") { return false }
+        if lower.range(of: "^[a-f0-9]{16,}$", options: .regularExpression) != nil { return true }
+        if lower.range(of: "^[a-z0-9_-]{20,}$", options: .regularExpression) != nil { return true }
+        let letters = lower.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        let digits = lower.unicodeScalars.filter { CharacterSet.decimalDigits.contains($0) }.count
+        return lower.count >= 10 && letters > 0 && digits > 0
     }
 }

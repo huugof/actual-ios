@@ -10,6 +10,7 @@
 		0B336F00144EAFC488A017EC /* ActualAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57CA480FDD3015F7AABF4828 /* ActualAPIClient.swift */; };
 		279ABB2DCEB4DA9B8F2BE3AC /* LookupRankerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD387131A9D5B29894254D22 /* LookupRankerTests.swift */; };
 		3242E8442B2E3E60D9EECCB6 /* Utilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26351C9793087984E2744F09 /* Utilities.swift */; };
+		A1B2C3D4E5F6A7B8C9D0E1F2 /* DateHelpers.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6A7B8C9D0E1F3 /* DateHelpers.swift */; };
 		3911200CACD43D2C442BCFEC /* SyncEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60251C36C95150178E0C7F28 /* SyncEngine.swift */; };
 		425792E8765D18420DF76A5F /* MutationPayloads.swift in Sources */ = {isa = PBXBuildFile; fileRef = 671FB3D2C3FBB37B0EF7CAFE /* MutationPayloads.swift */; };
 		44BF9FA486BBF054469F21DE /* HomeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17C247049FCD335E48F457A0 /* HomeService.swift */; };
@@ -59,6 +60,7 @@
 		1E8A4950066496B186D3C87D /* SettingsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewModel.swift; sourceTree = "<group>"; };
 		2454613BA54F57EE28A27D59 /* DatabaseService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabaseService.swift; sourceTree = "<group>"; };
 		26351C9793087984E2744F09 /* Utilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Utilities.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F6A7B8C9D0E1F3 /* DateHelpers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DateHelpers.swift; sourceTree = "<group>"; };
 		383B17396CD895CA482EB6FF /* TransactionServiceAmountSignTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransactionServiceAmountSignTests.swift; sourceTree = "<group>"; };
 		4C1E6CCD9B49335DE74CE421 /* AppContainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppContainer.swift; sourceTree = "<group>"; };
 		4E29CD050DE326D295D114D4 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
@@ -212,6 +214,7 @@
 		BFF2D109488A44AEF8F14726 /* Domain */ = {
 			isa = PBXGroup;
 			children = (
+				A1B2C3D4E5F6A7B8C9D0E1F3 /* DateHelpers.swift */,
 				4E29CD050DE326D295D114D4 /* Models.swift */,
 				26351C9793087984E2744F09 /* Utilities.swift */,
 			);
@@ -375,6 +378,7 @@
 				3911200CACD43D2C442BCFEC /* SyncEngine.swift in Sources */,
 				EB20D2971BE1D09B83A75ADE /* TransactionService.swift in Sources */,
 				3242E8442B2E3E60D9EECCB6 /* Utilities.swift in Sources */,
+					A1B2C3D4E5F6A7B8C9D0E1F2 /* DateHelpers.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -392,6 +396,7 @@
 		01C970AF8FC668B162E3D6C1 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -408,6 +413,7 @@
 		155C5A42B1112EF857198778 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

@@ -8,6 +8,7 @@ final class HomeViewModel: ObservableObject {
     @Published private(set) var otherBudgetStatuses: [CategoryBudgetStatus] = []
     @Published private(set) var recents: [RecentTransactionItem] = []
     @Published private(set) var queuedCount: Int = 0
+    @Published private(set) var blockedReviewItems: [BlockedMutationReviewItem] = []
     @Published var isLoading = false
     @Published var isSyncing = false
     @Published private(set) var syncStatusText: String = "Up to date"
@@ -19,14 +20,21 @@ final class HomeViewModel: ObservableObject {
 
     private let homeService: HomeService
     private let transactionService: TransactionService
+    private var startupSyncNotice: String?
     private var isMutationSyncInFlight = false
     private var pendingMutationSyncRequest = false
     private var pullSyncTask: Task<Void, Never>?
     private var retryMutationTask: Task<Void, Never>?
 
-    init(homeService: HomeService, transactionService: TransactionService) {
+    init(
+        homeService: HomeService,
+        transactionService: TransactionService,
+        startupSyncNotice: String? = nil
+    ) {
         self.homeService = homeService
         self.transactionService = transactionService
+        self.startupSyncNotice = startupSyncNotice
+        self.syncWarningMessage = startupSyncNotice
     }
 
     func onAppear() {
@@ -65,20 +73,31 @@ final class HomeViewModel: ObservableObject {
         pullSyncTask = nil
     }
 
-    func loadCurrentMonthTransactions(categoryID: String) async throws -> [RecentTransactionItem] {
+    func loadCurrentMonthTransactions(categoryID: String) async throws -> [CategoryDetailTransactionItem] {
         try await homeService.loadCurrentMonthTransactions(categoryID: categoryID)
     }
 
-    func didSaveTransaction(localID: UUID, isNew: Bool) {
+    func didSaveTransaction(localID: UUID, isNew: Bool, originalDraft: TransactionDraft?) {
         Task {
             await loadSnapshot()
             if isNew {
                 toast = UndoToast(message: "Transaction saved", actionTitle: "Undo", action: { [weak self] in
                     Task { await self?.undoCreated(localID: localID) }
                 })
-            } else {
+            } else if let originalDraft, originalDraft.remoteID != nil {
+                // Only offer undo for transactions already confirmed on the server;
+                // unsynced edits would require queuing a second create mutation.
                 toast = UndoToast(message: "Transaction updated", actionTitle: "Undo", action: { [weak self] in
-                    Task { await self?.loadSnapshot() }
+                    Task {
+                        guard let self else { return }
+                        do {
+                            _ = try await self.transactionService.createOrUpdateTransaction(originalDraft)
+                            await self.loadSnapshot()
+                            self.scheduleMutationSync()
+                        } catch {
+                            self.errorMessage = error.localizedDescription
+                        }
+                    }
                 })
             }
             scheduleMutationSync()
@@ -88,10 +107,14 @@ final class HomeViewModel: ObservableObject {
     func delete(_ item: RecentTransactionItem) {
         Task {
             do {
+                // Capture split amounts before deletion so the undo restore is accurate.
+                let splits = item.isSplit
+                    ? (try? await transactionService.fetchSplits(for: item.id)) ?? []
+                    : []
                 try await homeService.deleteTransaction(item)
                 await loadSnapshot()
                 toast = UndoToast(message: "Transaction deleted", actionTitle: "Undo", action: { [weak self] in
-                    Task { await self?.restoreDeleted(item) }
+                    Task { await self?.restoreDeleted(item, splits: splits) }
                 })
                 scheduleMutationSync()
             } catch {
@@ -106,6 +129,38 @@ final class HomeViewModel: ObservableObject {
 
     func clearSyncWarning() {
         syncWarningMessage = nil
+    }
+
+    var canReviewBlockedMutations: Bool {
+        !blockedReviewItems.isEmpty
+    }
+
+    func loadBlockedMutationReviews() async {
+        do {
+            blockedReviewItems = try await homeService.fetchBlockedMutationReviewItems()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func retryBlockedMutation(_ item: BlockedMutationReviewItem) {
+        Task {
+            await homeService.retryBlockedMutation(item.id)
+            await loadSnapshot()
+            await scheduleRetryIfNeeded()
+        }
+    }
+
+    func dismissBlockedMutation(_ item: BlockedMutationReviewItem) {
+        Task {
+            do {
+                try await homeService.dismissBlockedMutation(item.id)
+                await loadSnapshot()
+                await scheduleRetryIfNeeded()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 
     private static func isCancellation(_ error: Error) -> Bool {
@@ -170,7 +225,7 @@ final class HomeViewModel: ObservableObject {
         }
     }
 
-    private func restoreDeleted(_ item: RecentTransactionItem) async {
+    private func restoreDeleted(_ item: RecentTransactionItem, splits: [TransactionSplit]) async {
         var draft = TransactionDraft()
         draft.localID = UUID()
         draft.amountMinor = item.amountMinor
@@ -178,10 +233,11 @@ final class HomeViewModel: ObservableObject {
         draft.accountID = item.accountID
         draft.date = item.date
         draft.note = item.note
-        if item.isSplit {
-            let firstCategory = item.categoryIDs.first ?? ""
-            let splits = item.categoryIDs.prefix(2).map { TransactionSplit(id: UUID(), categoryID: $0, amountMinor: item.amountMinor / 2) }
-            draft.categoryMode = splits.count >= 2 ? .split(Array(splits)) : .single(categoryID: firstCategory)
+        if item.isSplit, splits.count >= 2 {
+            // Restore with the original per-category amounts captured before deletion.
+            draft.categoryMode = .split(splits.map {
+                TransactionSplit(id: UUID(), categoryID: $0.categoryID, amountMinor: $0.amountMinor)
+            })
         } else {
             draft.categoryMode = .single(categoryID: item.categoryIDs.first ?? "")
         }
@@ -255,7 +311,6 @@ final class HomeViewModel: ObservableObject {
                 return
             }
             errorMessage = error.localizedDescription
-            syncWarningMessage = nil
         }
         await loadSnapshot()
         await scheduleRetryIfNeeded()
@@ -267,19 +322,48 @@ final class HomeViewModel: ObservableObject {
 
         do {
             let state = try await homeService.pendingSyncState()
-            queuedCount = state.pendingCount
+            if state.blockedCount == 0 {
+                startupSyncNotice = nil
+                blockedReviewItems = []
+            } else {
+                await loadBlockedMutationReviews()
+            }
 
-            guard state.pendingCount > 0 else {
+            queuedCount = state.actionableCount
+
+            if state.blockedCount > 0 {
+                setSyncStatus(
+                    text: "Needs review • \(state.blockedCount)",
+                    icon: "exclamationmark.triangle.fill",
+                    active: true
+                )
+                syncWarningMessage = state.latestError ?? startupSyncNotice
+                return
+            }
+
+            guard state.actionableCount > 0 else {
+                syncWarningMessage = nil
                 updateIdleStatus()
+                return
+            }
+
+            if state.syncingCount > 0, state.queuedCount == 0 {
+                setSyncStatus(
+                    text: "Syncing • \(state.syncingCount)",
+                    icon: "arrow.triangle.2.circlepath.circle.fill",
+                    active: true
+                )
+                syncWarningMessage = state.latestError
                 return
             }
 
             guard let nextAttemptAt = state.nextAttemptAt else {
                 setSyncStatus(
-                    text: "Queued • \(state.pendingCount)",
+                    text: "Queued • \(state.actionableCount)",
                     icon: "tray.and.arrow.up.fill",
                     active: true
                 )
+                syncWarningMessage = state.latestError
                 return
             }
 
@@ -291,10 +375,11 @@ final class HomeViewModel: ObservableObject {
             }
 
             setSyncStatus(
-                text: "Retry in \(remaining)s • \(state.pendingCount)",
+                text: "Retry in \(remaining)s • \(state.actionableCount)",
                 icon: "clock.arrow.circlepath",
                 active: true
             )
+            syncWarningMessage = state.latestError
 
             retryMutationTask = Task { [weak self] in
                 guard let self else { return }
@@ -306,7 +391,7 @@ final class HomeViewModel: ObservableObject {
                     remaining -= 1
                     await MainActor.run {
                         self.setSyncStatus(
-                            text: "Retry in \(remaining)s • \(state.pendingCount)",
+                            text: "Retry in \(remaining)s • \(state.actionableCount)",
                             icon: "clock.arrow.circlepath",
                             active: true
                         )

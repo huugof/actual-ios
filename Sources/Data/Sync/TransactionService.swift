@@ -39,6 +39,10 @@ actor TransactionService {
         try await database.loadDraft(localID: localID)
     }
 
+    func fetchSplits(for transactionID: UUID) async throws -> [TransactionSplit] {
+        try await database.fetchSplits(for: transactionID)
+    }
+
     func createOrUpdateTransaction(_ draft: TransactionDraft) async throws -> UUID {
         guard draft.isValidToSave else {
             throw NSError(domain: "TransactionService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Transaction form is incomplete"])
@@ -150,6 +154,7 @@ actor TransactionService {
     private func buildMutation(for draft: TransactionDraft, localID: UUID) throws -> PendingMutation {
         let now = Date.now
         let payloadEncoder = JSONEncoder()
+        let importedID = Self.importedID(for: localID)
 
         switch draft.categoryMode {
         case .single(let categoryID):
@@ -165,7 +170,8 @@ actor TransactionService {
                 }(),
                 notes: draft.note.isEmpty ? nil : draft.note,
                 categoryID: categoryID,
-                splits: nil
+                splits: nil,
+                importedID: importedID
             )
 
             if let remoteID = draft.remoteID {
@@ -220,7 +226,8 @@ actor TransactionService {
                 }(),
                 notes: draft.note.isEmpty ? nil : draft.note,
                 categoryID: nil,
-                splits: splitPayload
+                splits: splitPayload,
+                importedID: importedID
             )
 
             if let remoteID = draft.remoteID {
@@ -299,7 +306,7 @@ actor TransactionService {
     }
 
     private static func currentMonthSpentImpact(for draft: TransactionDraft, calendar: Calendar = .current) -> [String: Int64] {
-        guard monthPrefix(from: draft.date.value) == currentMonthPrefix(calendar: calendar) else {
+        guard DateHelpers.monthPrefix(from: draft.date.value) == DateHelpers.currentMonthPrefix(calendar: calendar) else {
             return [:]
         }
         switch draft.categoryMode {
@@ -315,20 +322,7 @@ actor TransactionService {
         }
     }
 
-    private static func monthPrefix(from rawDate: String) -> String? {
-        let trimmed = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 7 else { return nil }
-        let prefix = String(trimmed.prefix(7))
-        guard prefix.range(of: #"^\d{4}-\d{2}$"#, options: .regularExpression) != nil else {
-            return nil
-        }
-        return prefix
-    }
-
-    private static func currentMonthPrefix(calendar: Calendar = .current) -> String {
-        let components = calendar.dateComponents([.year, .month], from: .now)
-        let year = components.year ?? 1970
-        let month = components.month ?? 1
-        return String(format: "%04d-%02d", year, month)
+    private static func importedID(for localID: UUID) -> String {
+        "ios:\(localID.uuidString.lowercased())"
     }
 }

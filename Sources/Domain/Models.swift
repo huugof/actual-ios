@@ -225,12 +225,45 @@ struct RecentTransactionItem: Codable, Equatable, Identifiable, Sendable {
     var updatedAt: Date
 }
 
+struct SyncedRecentTransactionItem: Equatable, Sendable {
+    var transaction: RecentTransactionItem
+    var splits: [TransactionSplit]
+}
+
+struct CategoryDetailTransactionItem: Equatable, Identifiable, Sendable {
+    var transaction: RecentTransactionItem
+    var displayAmountMinor: Int64
+
+    var id: UUID { transaction.id }
+}
+
 struct HomeSnapshot: Equatable, Sendable {
     var trackedStatuses: [CategoryBudgetStatus]
     var overallBudget: BudgetSummary
     var otherBudgetStatuses: [CategoryBudgetStatus]
     var recents: [RecentTransactionItem]
     var queuedMutationCount: Int
+}
+
+struct PendingMutationSummary: Equatable, Sendable {
+    var queuedCount: Int
+    var syncingCount: Int
+    var blockedCount: Int
+    var nextAttemptAt: Date?
+    var latestError: String?
+
+    var actionableCount: Int {
+        queuedCount + syncingCount
+    }
+}
+
+struct BlockedMutationReviewItem: Equatable, Identifiable, Sendable {
+    let id: UUID
+    let type: PendingMutationType
+    let createdAt: Date
+    let lastError: String
+    let transaction: RecentTransactionItem?
+    let proposedPayeeName: String?
 }
 
 enum PendingMutationType: String, Codable, Sendable {
@@ -243,6 +276,7 @@ enum PendingMutationType: String, Codable, Sendable {
 enum PendingMutationState: String, Codable, Sendable {
     case queued
     case syncing
+    case blocked
     case failed
 }
 

@@ -2,8 +2,15 @@ import Foundation
 
 actor HomeService {
     struct PendingSyncState: Sendable {
-        let pendingCount: Int
+        let queuedCount: Int
+        let syncingCount: Int
+        let blockedCount: Int
         let nextAttemptAt: Date?
+        let latestError: String?
+
+        var actionableCount: Int {
+            queuedCount + syncingCount
+        }
     }
 
     private let database: DatabaseService
@@ -34,11 +41,30 @@ actor HomeService {
     }
 
     func pendingSyncState() async throws -> PendingSyncState {
-        let state = try await database.pendingMutationRetryState()
+        let state = try await database.pendingMutationSummary()
         return PendingSyncState(
-            pendingCount: state.pendingCount,
-            nextAttemptAt: state.nextAttemptAt
+            queuedCount: state.queuedCount,
+            syncingCount: state.syncingCount,
+            blockedCount: state.blockedCount,
+            nextAttemptAt: state.nextAttemptAt,
+            latestError: state.latestError
         )
+    }
+
+    func recoverInterruptedMutations() async -> InterruptedMutationRecoverySummary {
+        await syncEngine.recoverInterruptedMutations()
+    }
+
+    func fetchBlockedMutationReviewItems() async throws -> [BlockedMutationReviewItem] {
+        try await database.fetchBlockedMutationReviewItems()
+    }
+
+    func dismissBlockedMutation(_ id: UUID) async throws {
+        try await database.dismissBlockedMutation(id)
+    }
+
+    func retryBlockedMutation(_ id: UUID) async {
+        await syncEngine.retryBlockedMutation(id)
     }
 
     func deleteTransaction(_ item: RecentTransactionItem) async throws {
@@ -57,18 +83,11 @@ actor HomeService {
         try await database.fetchAllCategories()
     }
 
-    func loadCurrentMonthTransactions(categoryID: String, limit: Int = 120) async throws -> [RecentTransactionItem] {
+    func loadCurrentMonthTransactions(categoryID: String, limit: Int = 120) async throws -> [CategoryDetailTransactionItem] {
         try await database.fetchTransactionsForCategory(
             categoryID,
-            monthPrefix: Self.currentMonthPrefix(),
+            monthPrefix: DateHelpers.currentMonthPrefix(),
             limit: limit
         )
-    }
-
-    private static func currentMonthPrefix(calendar: Calendar = .current) -> String {
-        let components = calendar.dateComponents([.year, .month], from: .now)
-        let year = components.year ?? 1970
-        let month = components.month ?? 1
-        return String(format: "%04d-%02d", year, month)
     }
 }

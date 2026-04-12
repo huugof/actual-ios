@@ -36,6 +36,30 @@ struct MutationApplyResult: Sendable {
     let touchedMonth: String?
 }
 
+struct InterruptedMutationRecoverySummary: Sendable {
+    var requeuedCount: Int = 0
+    var resolvedCount: Int = 0
+    var blockedCount: Int = 0
+    var latestBlockedError: String?
+
+    var notice: String? {
+        guard blockedCount > 0 else { return nil }
+        if blockedCount == 1, let latestBlockedError {
+            return latestBlockedError
+        }
+        if let latestBlockedError {
+            return "\(blockedCount) sync items need review. \(latestBlockedError)"
+        }
+        return "\(blockedCount) sync items need review."
+    }
+}
+
+private enum MutationRecoveryDisposition: Sendable {
+    case requeued
+    case resolved
+    case blocked(String)
+}
+
 actor SyncEngine {
     private let database: DatabaseService
     private let api: ActualAPIClientProtocol
@@ -140,6 +164,31 @@ actor SyncEngine {
         _ = try await processPendingMutationsDraining()
     }
 
+    func recoverInterruptedMutations() async -> InterruptedMutationRecoverySummary {
+        do {
+            let interrupted = try await database.fetchInterruptedMutations()
+            guard !interrupted.isEmpty else { return InterruptedMutationRecoverySummary() }
+
+            return await summarizeRecovery(interrupted)
+        } catch {
+            return InterruptedMutationRecoverySummary(
+                requeuedCount: 0,
+                resolvedCount: 0,
+                blockedCount: 1,
+                latestBlockedError: "Interrupted sync recovery failed: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    func retryBlockedMutation(_ id: UUID) async {
+        guard let mutation = try? await database.fetchPendingMutation(id: id),
+              mutation.state == .blocked else {
+            return
+        }
+
+        _ = await summarizeRecovery([mutation])
+    }
+
     private func processPendingMutationsDraining(
         batchSize: Int = 50,
         maxBatches: Int = 20
@@ -193,10 +242,10 @@ actor SyncEngine {
                 allowPartialFailures: allowPartialFailures
             )
             let pendingDeletes = try await pendingDeleteIDs
-            let filteredRecents = fetchedRecents.filter { !pendingDeletes.contains($0.id) }
+            let filteredRecents = fetchedRecents.filter { !pendingDeletes.contains($0.transaction.id) }
             try await database.upsertRecentTransactions(filteredRecents)
             if pruneServerMissing {
-                let keepRemoteIDs = Set(filteredRecents.compactMap(\.remoteID))
+                let keepRemoteIDs = Set(filteredRecents.compactMap(\.transaction.remoteID))
                 let protectedLocalIDs = try await database.fetchPendingMutationTransactionLocalIDs()
                 _ = try await database.pruneRemoteTransactions(
                     monthPrefixes: pruneMonthPrefixes,
@@ -207,6 +256,101 @@ actor SyncEngine {
             return nil
         } catch {
             return Self.softSyncWarning(prefix: "Recent transactions refresh skipped", error: error)
+        }
+    }
+
+    private func summarizeRecovery(_ mutations: [PendingMutation]) async -> InterruptedMutationRecoverySummary {
+        var summary = InterruptedMutationRecoverySummary()
+
+        for mutation in mutations {
+            do {
+                let disposition = try await recoverMutation(mutation)
+                switch disposition {
+                case .requeued:
+                    summary.requeuedCount += 1
+                case .resolved:
+                    summary.resolvedCount += 1
+                case .blocked(let reason):
+                    summary.blockedCount += 1
+                    summary.latestBlockedError = reason
+                }
+            } catch {
+                let reason = "Interrupted sync recovery failed: \(error.localizedDescription)"
+                try? await database.markMutationBlocked(mutation.id, lastError: reason)
+                summary.blockedCount += 1
+                summary.latestBlockedError = reason
+            }
+        }
+
+        return summary
+    }
+
+    private func recoverMutation(_ mutation: PendingMutation) async throws -> MutationRecoveryDisposition {
+        switch mutation.type {
+        case .updateTransaction, .deleteTransaction:
+            try await database.requeueMutation(mutation.id, nextAttemptAt: .now)
+            return .requeued
+
+        case .createTransaction:
+            let envelope = try JSONDecoder().decode(MutationEnvelope<CreateTransactionMutation>.self, from: mutation.payload)
+            if let importedID = envelope.data.payload.importedID, !importedID.isEmpty {
+                try await database.requeueMutation(mutation.id, nextAttemptAt: .now)
+                return .requeued
+            }
+
+            do {
+                try await refreshRecoveryTransactions(
+                    accountID: envelope.data.payload.accountID,
+                    dateString: envelope.data.payload.date
+                )
+                let candidates = try await database.fetchRemoteTransactions(
+                    accountID: envelope.data.payload.accountID,
+                    date: envelope.data.payload.date
+                )
+                let matches = candidates.filter { Self.matchesRecoveryCreate(payload: envelope.data.payload, candidate: $0) }
+
+                if matches.count == 1, let match = matches.first {
+                    if match.transaction.id != envelope.data.localTransactionID {
+                        try await database.deleteTransaction(localID: envelope.data.localTransactionID)
+                    } else if let remoteID = match.transaction.remoteID, !remoteID.isEmpty {
+                        try await database.setTransactionRemoteID(localID: envelope.data.localTransactionID, remoteID: remoteID)
+                    }
+                    try await database.markMutationCompleted(mutation.id)
+                    return .resolved
+                }
+
+                let reason = matches.isEmpty
+                    ? "Interrupted transaction create could not be verified against the server. Review the transaction before retrying."
+                    : "Interrupted transaction create matched multiple server transactions. Review the transaction before retrying."
+                try await database.markMutationBlocked(mutation.id, lastError: reason)
+                return .blocked(reason)
+            } catch {
+                let reason = "Interrupted transaction create could not be verified: \(error.localizedDescription)"
+                try await database.markMutationBlocked(mutation.id, lastError: reason)
+                return .blocked(reason)
+            }
+
+        case .createPayee:
+            let envelope = try JSONDecoder().decode(MutationEnvelope<CreatePayeeMutation>.self, from: mutation.payload)
+            do {
+                let payees = try await api.fetchPayees()
+                let matches = payees.filter {
+                    Self.normalizedRecoveryText($0.name) == Self.normalizedRecoveryText(envelope.data.proposedName)
+                }
+                if matches.count == 1, let payee = matches.first {
+                    try await database.upsertPayee(payee)
+                    try await database.markMutationCompleted(mutation.id)
+                    return .resolved
+                }
+
+                let reason = "Interrupted payee create could not be safely retried automatically. Review payees before retrying."
+                try await database.markMutationBlocked(mutation.id, lastError: reason)
+                return .blocked(reason)
+            } catch {
+                let reason = "Interrupted payee create could not be verified: \(error.localizedDescription)"
+                try await database.markMutationBlocked(mutation.id, lastError: reason)
+                return .blocked(reason)
+            }
         }
     }
 
@@ -250,7 +394,7 @@ actor SyncEngine {
             return MutationApplyResult(
                 isTransactionMutation: true,
                 touchedAccountID: envelope.data.payload.accountID,
-                touchedMonth: Self.monthPrefix(dateString: envelope.data.payload.date)
+                touchedMonth: DateHelpers.monthPrefix(from: envelope.data.payload.date)
             )
 
         case .updateTransaction:
@@ -259,7 +403,7 @@ actor SyncEngine {
             return MutationApplyResult(
                 isTransactionMutation: true,
                 touchedAccountID: envelope.data.payload.accountID,
-                touchedMonth: Self.monthPrefix(dateString: envelope.data.payload.date)
+                touchedMonth: DateHelpers.monthPrefix(from: envelope.data.payload.date)
             )
 
         case .deleteTransaction:
@@ -322,41 +466,71 @@ actor SyncEngine {
     }
 
     private static func budgetMonthCandidates(preferredMonths: [String], calendar: Calendar = .current) -> [String] {
-        let current = Self.monthString(offset: 0, calendar: calendar)
-        let previous = Self.monthString(offset: -1, calendar: calendar)
-        return uniquePreservingOrder(preferredMonths + [current, previous])
-    }
-
-    private static func monthString(offset: Int, calendar: Calendar) -> String {
-        let date = calendar.date(byAdding: .month, value: offset, to: .now) ?? .now
-        let components = calendar.dateComponents([.year, .month], from: date)
-        let year = components.year ?? 1970
-        let month = components.month ?? 1
-        return String(format: "%04d-%02d", year, month)
+        let current = DateHelpers.monthString(offset: 0, calendar: calendar)
+        let previous = DateHelpers.monthString(offset: -1, calendar: calendar)
+        return DateHelpers.uniquePreservingOrder(preferredMonths + [current, previous])
     }
 
     private static func recentMonthPrefixes(calendar: Calendar = .current) -> [String] {
-        [monthString(offset: 0, calendar: calendar), monthString(offset: -1, calendar: calendar)]
+        [DateHelpers.monthString(offset: 0, calendar: calendar),
+         DateHelpers.monthString(offset: -1, calendar: calendar)]
     }
 
-    private static func monthPrefix(dateString: String) -> String? {
-        let trimmed = dateString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 7 else { return nil }
-        let prefix = String(trimmed.prefix(7))
-        guard prefix.range(of: #"^\d{4}-\d{2}$"#, options: .regularExpression) != nil else {
-            return nil
+    private func refreshRecoveryTransactions(accountID: String, dateString: String) async throws {
+        let recents = try await api.fetchRecentTransactions(
+            limit: 250,
+            daysBack: Self.recoveryDaysBack(dateString: dateString),
+            accountIDs: [accountID],
+            allowPartialFailures: false
+        )
+        try await database.upsertRecentTransactions(recents)
+    }
+
+    private static func recoveryDaysBack(dateString: String, calendar: Calendar = .current) -> Int {
+        guard let date = LocalDate(dateString).toDate(calendar: calendar) else {
+            return 62
         }
-        return prefix
+        let startOfDay = calendar.startOfDay(for: date)
+        let today = calendar.startOfDay(for: .now)
+        let rawDays = calendar.dateComponents([.day], from: startOfDay, to: today).day ?? 0
+        return max(62, rawDays + 7)
     }
 
-    private static func uniquePreservingOrder(_ values: [String]) -> [String] {
-        var seen = Set<String>()
-        var output: [String] = []
-        for value in values where !value.isEmpty {
-            if seen.insert(value).inserted {
-                output.append(value)
+    private static func matchesRecoveryCreate(
+        payload: APICreateTransactionPayload,
+        candidate: SyncedRecentTransactionItem
+    ) -> Bool {
+        let transaction = candidate.transaction
+        guard transaction.accountID == payload.accountID else { return false }
+        guard transaction.date.value == payload.date else { return false }
+        guard transaction.amountMinor == payload.amountMinor else { return false }
+        guard normalizedRecoveryText(transaction.note) == normalizedRecoveryText(payload.notes) else { return false }
+
+        if let payeeID = payload.payeeID, !payeeID.isEmpty {
+            guard transaction.payeeID == payeeID else { return false }
+        } else {
+            guard normalizedRecoveryText(transaction.payeeName) == normalizedRecoveryText(payload.payeeName) else {
+                return false
             }
         }
-        return output
+
+        if let categoryID = payload.categoryID, !categoryID.isEmpty {
+            return !transaction.isSplit && transaction.categoryIDs == [categoryID]
+        }
+
+        let payloadSplits = (payload.splits ?? [])
+            .map { "\($0.categoryID)|\($0.amountMinor)" }
+            .sorted()
+        let candidateSplits = candidate.splits
+            .map { "\($0.categoryID)|\($0.amountMinor)" }
+            .sorted()
+        return payloadSplits == candidateSplits
     }
+
+    private static func normalizedRecoveryText(_ value: String?) -> String {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+    }
+
 }

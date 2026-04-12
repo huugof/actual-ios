@@ -163,6 +163,7 @@ actor DatabaseService {
 
     func upsertCategories(_ categories: [CategorySyncPayload]) async throws {
         try await dbQueue.write { db in
+            let incomingIDs = Set(categories.map(\.id))
             for category in categories {
                 let row = CategoryRow(
                     id: category.id,
@@ -174,6 +175,23 @@ actor DatabaseService {
                     updatedAt: .now
                 )
                 try row.save(db)
+            }
+
+            if incomingIDs.isEmpty {
+                try TrackedCategoryRow.deleteAll(db)
+                try CategoryRow.deleteAll(db)
+            } else {
+                let ids = Array(incomingIDs)
+                let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+                let arguments = StatementArguments(ids)
+                try db.execute(
+                    sql: "DELETE FROM tracked_categories WHERE categoryID NOT IN (\(placeholders))",
+                    arguments: arguments
+                )
+                try db.execute(
+                    sql: "DELETE FROM categories WHERE id NOT IN (\(placeholders))",
+                    arguments: arguments
+                )
             }
         }
     }
@@ -316,35 +334,23 @@ actor DatabaseService {
                     return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
                 }
 
-            let txRequest = TransactionRow.order(Column("date").desc, Column("updatedAt").desc).limit(recentLimit)
+            let queuedCount = try Self.fetchActiveQueuedMutationCount(db)
+
+            let recents: [RecentTransactionItem]
             if filterMode == .trackedOnly, !trackedIDs.isEmpty {
                 let all = try TransactionRow.order(Column("date").desc, Column("updatedAt").desc).fetchAll(db)
                 let filtered = all.filter { !trackedSet.isDisjoint(with: Set($0.categoryIDs)) }
-                let recents = Array(filtered.prefix(recentLimit)).map {
-                    Self.resolveRecent(
-                        row: $0,
-                        payeeNameByID: payeeNameByID,
-                        categoryNameByID: categoryNameByID
-                    )
+                recents = Array(filtered.prefix(recentLimit)).map {
+                    Self.resolveRecent(row: $0, payeeNameByID: payeeNameByID, categoryNameByID: categoryNameByID)
                 }
-                let queuedCount = try PendingMutationRow.filter(Column("state") != PendingMutationState.failed.rawValue).fetchCount(db)
-                return HomeSnapshot(
-                    trackedStatuses: statuses,
-                    overallBudget: overallBudget,
-                    otherBudgetStatuses: otherBudgetStatuses,
-                    recents: recents,
-                    queuedMutationCount: queuedCount
-                )
+            } else {
+                recents = try TransactionRow
+                    .order(Column("date").desc, Column("updatedAt").desc)
+                    .limit(recentLimit)
+                    .fetchAll(db)
+                    .map { Self.resolveRecent(row: $0, payeeNameByID: payeeNameByID, categoryNameByID: categoryNameByID) }
             }
 
-            let recents = try txRequest.fetchAll(db).map {
-                Self.resolveRecent(
-                    row: $0,
-                    payeeNameByID: payeeNameByID,
-                    categoryNameByID: categoryNameByID
-                )
-            }
-            let queuedCount = try PendingMutationRow.filter(Column("state") != PendingMutationState.failed.rawValue).fetchCount(db)
             return HomeSnapshot(
                 trackedStatuses: statuses,
                 overallBudget: overallBudget,
@@ -359,7 +365,7 @@ actor DatabaseService {
         _ categoryID: String,
         monthPrefix: String,
         limit: Int
-    ) async throws -> [RecentTransactionItem] {
+    ) async throws -> [CategoryDetailTransactionItem] {
         try await dbQueue.read { db in
             let payeeNameByID = Dictionary(uniqueKeysWithValues: try PayeeRow.fetchAll(db).map { ($0.id, $0.name) })
             let categoryNameByID = Dictionary(uniqueKeysWithValues: try CategoryRow.fetchAll(db).map { ($0.id, $0.name) })
@@ -369,11 +375,27 @@ actor DatabaseService {
                 .fetchAll(db)
 
             let filtered = rows.filter { $0.categoryIDs.contains(categoryID) }
-            return Array(filtered.prefix(limit)).map {
-                Self.resolveRecent(
-                    row: $0,
+            let filteredRows = Array(filtered.prefix(limit))
+            let filteredIDs = Set(filteredRows.map(\.id))
+            let matchingSplitTotals = try SplitLineRow
+                .filter(Column("categoryID") == categoryID)
+                .fetchAll(db)
+                .filter { filteredIDs.contains($0.transactionID) }
+                .reduce(into: [UUID: Int64]()) { partial, row in
+                    partial[row.transactionID, default: 0] += row.amountMinor
+                }
+
+            return filteredRows.map { row in
+                let transaction = Self.resolveRecent(
+                    row: row,
                     payeeNameByID: payeeNameByID,
                     categoryNameByID: categoryNameByID
+                )
+                return CategoryDetailTransactionItem(
+                    transaction: transaction,
+                    displayAmountMinor: row.isSplit
+                        ? (matchingSplitTotals[row.id] ?? row.amountMinor)
+                        : row.amountMinor
                 )
             }
         }
@@ -521,9 +543,10 @@ actor DatabaseService {
         }
     }
 
-    func upsertRecentTransactions(_ transactions: [RecentTransactionItem]) async throws {
+    func upsertRecentTransactions(_ transactions: [SyncedRecentTransactionItem]) async throws {
         try await dbQueue.write { db in
-            for transaction in transactions {
+            for syncedTransaction in transactions {
+                let transaction = syncedTransaction.transaction
                 var localID = transaction.id
                 if let remoteID = transaction.remoteID,
                    let existingID = try UUID.fetchOne(
@@ -548,6 +571,15 @@ actor DatabaseService {
                     updatedAt: transaction.updatedAt
                 )
                 try row.save(db)
+                try SplitLineRow.filter(Column("transactionID") == localID).deleteAll(db)
+                for split in syncedTransaction.splits {
+                    try SplitLineRow(
+                        id: split.id,
+                        transactionID: localID,
+                        categoryID: split.categoryID,
+                        amountMinor: split.amountMinor
+                    ).insert(db)
+                }
             }
         }
     }
@@ -563,14 +595,18 @@ actor DatabaseService {
         guard !normalizedPrefixes.isEmpty else { return 0 }
 
         return try await dbQueue.write { db in
-            let rows = try TransactionRow.fetchAll(db)
-            let stale = rows.filter { row in
-                guard let remoteID = row.remoteID, !remoteID.isEmpty else { return false }
+            // Pre-filter in SQL to only rows that have a remoteID and fall within the
+            // given month prefixes, then apply set-membership checks in Swift.
+            let monthLikes = normalizedPrefixes.map { _ in "date LIKE ?" }.joined(separator: " OR ")
+            let candidates = try TransactionRow.fetchAll(
+                db,
+                sql: "SELECT * FROM transactions WHERE remoteID IS NOT NULL AND remoteID != '' AND (\(monthLikes))",
+                arguments: StatementArguments(normalizedPrefixes.map { "\($0)%" })
+            )
+
+            let stale = candidates.filter { row in
+                guard let remoteID = row.remoteID else { return false }
                 if protectedLocalIDs.contains(row.id) { return false }
-                let inScope = normalizedPrefixes.contains { prefix in
-                    row.date.hasPrefix(prefix)
-                }
-                guard inScope else { return false }
                 return !keepRemoteIDs.contains(remoteID)
             }
 
@@ -688,10 +724,28 @@ actor DatabaseService {
         }
     }
 
-    func pendingMutationRetryState() async throws -> (pendingCount: Int, nextAttemptAt: Date?) {
+    func pendingMutationSummary() async throws -> PendingMutationSummary {
         try await dbQueue.read { db in
-            let pendingCount = try PendingMutationRow
-                .filter(Column("state") != PendingMutationState.failed.rawValue)
+            let queuedCount = try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*)
+                    FROM pending_mutations
+                    WHERE state = ?
+                """,
+                arguments: [PendingMutationState.queued.rawValue]
+            ) ?? 0
+            let syncingCount = try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*)
+                    FROM pending_mutations
+                    WHERE state = ?
+                """,
+                arguments: [PendingMutationState.syncing.rawValue]
+            ) ?? 0
+            let blockedCount = try PendingMutationRow
+                .filter(Column("state") == PendingMutationState.blocked.rawValue)
                 .fetchCount(db)
             let nextAttemptAt = try Date.fetchOne(
                 db,
@@ -702,7 +756,147 @@ actor DatabaseService {
                 """,
                 arguments: [PendingMutationState.queued.rawValue]
             )
-            return (pendingCount, nextAttemptAt)
+            let latestError = try String.fetchOne(
+                db,
+                sql: """
+                    SELECT lastError
+                    FROM pending_mutations
+                    WHERE state IN (?, ?, ?)
+                      AND lastError IS NOT NULL
+                      AND TRIM(lastError) != ''
+                    ORDER BY createdAt DESC
+                    LIMIT 1
+                """,
+                arguments: [
+                    PendingMutationState.queued.rawValue,
+                    PendingMutationState.syncing.rawValue,
+                    PendingMutationState.blocked.rawValue
+                ]
+            )
+            return PendingMutationSummary(
+                queuedCount: queuedCount,
+                syncingCount: syncingCount,
+                blockedCount: blockedCount,
+                nextAttemptAt: nextAttemptAt,
+                latestError: latestError
+            )
+        }
+    }
+
+    func fetchPendingMutation(id: UUID) async throws -> PendingMutation? {
+        try await dbQueue.read { db in
+            try PendingMutationRow.fetchOne(db, key: id)?.toDomain()
+        }
+    }
+
+    func fetchInterruptedMutations() async throws -> [PendingMutation] {
+        try await dbQueue.read { db in
+            let rows = try PendingMutationRow
+                .filter(Column("state") == PendingMutationState.syncing.rawValue)
+                .order(Column("createdAt"))
+                .fetchAll(db)
+            return rows.compactMap { $0.toDomain() }
+        }
+    }
+
+    func requeueMutation(_ id: UUID, lastError: String? = nil, nextAttemptAt: Date = .now) async throws {
+        try await dbQueue.write { db in
+            if let lastError, !lastError.isEmpty {
+                try db.execute(
+                    sql: "UPDATE pending_mutations SET state = ?, nextAttemptAt = ?, lastError = ? WHERE id = ?",
+                    arguments: [PendingMutationState.queued.rawValue, nextAttemptAt, lastError, id]
+                )
+            } else {
+                try db.execute(
+                    sql: "UPDATE pending_mutations SET state = ?, nextAttemptAt = ? WHERE id = ?",
+                    arguments: [PendingMutationState.queued.rawValue, nextAttemptAt, id]
+                )
+            }
+        }
+    }
+
+    func markMutationBlocked(_ id: UUID, lastError: String) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE pending_mutations SET state = ?, lastError = ? WHERE id = ?",
+                arguments: [PendingMutationState.blocked.rawValue, lastError, id]
+            )
+        }
+    }
+
+    func dismissBlockedMutation(_ id: UUID) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE pending_mutations SET state = ? WHERE id = ?",
+                arguments: [PendingMutationState.failed.rawValue, id]
+            )
+        }
+    }
+
+    func fetchBlockedMutationReviewItems() async throws -> [BlockedMutationReviewItem] {
+        try await dbQueue.read { db in
+            let rows = try PendingMutationRow
+                .filter(Column("state") == PendingMutationState.blocked.rawValue)
+                .order(Column("createdAt").desc)
+                .fetchAll(db)
+
+            return try rows.compactMap { row in
+                guard let mutation = row.toDomain() else { return nil }
+
+                let transaction: RecentTransactionItem?
+                if let localID = mutation.transactionLocalID {
+                    transaction = try TransactionRow.fetchOne(db, key: localID)?.domain
+                } else {
+                    transaction = nil
+                }
+
+                let proposedPayeeName: String?
+                if mutation.type == .createPayee {
+                    let envelope = try? JSONDecoder().decode(MutationEnvelope<CreatePayeeMutation>.self, from: mutation.payload)
+                    proposedPayeeName = envelope?.data.proposedName
+                } else {
+                    proposedPayeeName = nil
+                }
+
+                return BlockedMutationReviewItem(
+                    id: mutation.id,
+                    type: mutation.type,
+                    createdAt: mutation.createdAt,
+                    lastError: mutation.lastError ?? "Needs review",
+                    transaction: transaction,
+                    proposedPayeeName: proposedPayeeName
+                )
+            }
+        }
+    }
+
+    func fetchRemoteTransactions(accountID: String, date: String) async throws -> [SyncedRecentTransactionItem] {
+        try await dbQueue.read { db in
+            let rows = try TransactionRow.fetchAll(
+                db,
+                sql: """
+                    SELECT *
+                    FROM transactions
+                    WHERE accountID = ?
+                      AND date = ?
+                      AND remoteID IS NOT NULL
+                    ORDER BY updatedAt DESC
+                """,
+                arguments: [accountID, date]
+            )
+
+            return try rows.map { row in
+                let splitRows = try SplitLineRow
+                    .filter(Column("transactionID") == row.id)
+                    .order(Column("id"))
+                    .fetchAll(db)
+                return SyncedRecentTransactionItem(
+                    transaction: row.domain,
+                    splits: splitRows.map { split in
+                        TransactionSplit(id: split.id, categoryID: split.categoryID, amountMinor: split.amountMinor)
+                    }
+                )
+            }
         }
     }
 
@@ -761,6 +955,14 @@ actor DatabaseService {
             }
             return ids
         }
+    }
+
+    nonisolated private static func fetchActiveQueuedMutationCount(_ db: Database) throws -> Int {
+        try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM pending_mutations WHERE state IN (?, ?)",
+            arguments: [PendingMutationState.queued.rawValue, PendingMutationState.syncing.rawValue]
+        ) ?? 0
     }
 
     nonisolated private static func uuidFromDatabaseValue(_ value: DatabaseValue) -> UUID? {

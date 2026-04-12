@@ -14,12 +14,13 @@ struct HomeView: View {
 
     @State private var isShowingAdd = false
     @State private var categoryDetailTarget: CategoryDetailTarget?
-    @State private var categoryDetailTransactions: [RecentTransactionItem] = []
+    @State private var categoryDetailTransactions: [CategoryDetailTransactionItem] = []
     @State private var isCategoryDetailLoading = false
     @State private var categoryEditingTarget: EditingTarget?
-    @State private var pendingDeleteItem: RecentTransactionItem?
+    @State private var pendingDeleteItem: CategoryDetailTransactionItem?
     @State private var isShowingDeleteConfirm = false
     @State private var isOtherBudgetsExpanded = false
+    @State private var isShowingSyncReview = false
 
     init(
         viewModel: HomeViewModel,
@@ -123,11 +124,6 @@ struct HomeView: View {
                         }
                         .padding(12)
                         .background(.ultraThinMaterial, in: Capsule())
-                        .onAppear {
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-                                viewModel.clearToast()
-                            }
-                        }
                     }
 
                     if let warning = viewModel.syncWarningMessage {
@@ -138,67 +134,99 @@ struct HomeView: View {
                             .padding(.vertical, 8)
                             .background(.orange.opacity(0.92), in: Capsule())
                             .foregroundStyle(.white)
-                            .onAppear {
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-                                    viewModel.clearSyncWarning()
-                                }
+                            .contentShape(Capsule())
+                            .onTapGesture {
+                                guard viewModel.canReviewBlockedMutations else { return }
+                                isShowingSyncReview = true
                             }
                     }
                 }
                 .padding(.bottom, 12)
                 .padding(.horizontal, 12)
+                .task(id: viewModel.toast?.message) {
+                    guard viewModel.toast != nil else { return }
+                    try? await Task.sleep(nanoseconds: 6_000_000_000)
+                    if !Task.isCancelled { viewModel.clearToast() }
+                }
+                .task(id: viewModel.syncWarningMessage) {
+                    guard viewModel.syncWarningMessage != nil else { return }
+                    try? await Task.sleep(nanoseconds: 6_000_000_000)
+                    if !Task.isCancelled { viewModel.clearSyncWarning() }
+                }
             }
             .onChange(of: viewModel.errorMessage, initial: false) { _, newValue in
                 if newValue != nil {
                     viewModel.clearSyncWarning()
                 }
             }
+            .onChange(of: viewModel.blockedReviewItems, initial: false) { _, newValue in
+                if newValue.isEmpty {
+                    isShowingSyncReview = false
+                }
+            }
             .sheet(isPresented: $isShowingAdd) {
                 AddEditTransactionView(
                     viewModel: AddEditTransactionViewModel(mode: .add, service: transactionService),
-                    onSaved: { localID, isNew in
-                        viewModel.didSaveTransaction(localID: localID, isNew: isNew)
+                    onSaved: { localID, isNew, originalDraft in
+                        viewModel.didSaveTransaction(localID: localID, isNew: isNew, originalDraft: originalDraft)
+                    }
+                )
+            }
+            .sheet(isPresented: $isShowingSyncReview) {
+                BlockedSyncReviewSheet(
+                    items: viewModel.blockedReviewItems,
+                    onRetry: { item in
+                        viewModel.retryBlockedMutation(item)
+                    },
+                    onDismiss: { item in
+                        viewModel.dismissBlockedMutation(item)
                     }
                 )
             }
             .sheet(item: $categoryDetailTarget) { target in
                 NavigationStack {
-                    Group {
-                        if isCategoryDetailLoading {
-                            VStack(spacing: 10) {
-                                ProgressView()
-                                Text("Loading...")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        } else if categoryDetailTransactions.isEmpty {
-                            VStack(spacing: 10) {
-                                Text("No transactions this month")
-                                    .font(.headline)
-                                Text("No entries yet for \(target.name).")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        } else {
-                            List(categoryDetailTransactions) { item in
-                                RecentTransactionRow(item: item)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        categoryEditingTarget = EditingTarget(id: item.id)
-                                    }
-                                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                        Button(role: .destructive) {
-                                            pendingDeleteItem = item
-                                            isShowingDeleteConfirm = true
-                                        } label: {
-                                            Image(systemName: "trash")
+                    VStack(spacing: 12) {
+                        CategoryBudgetHeader(status: target.status)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 12)
+
+                        Group {
+                            if isCategoryDetailLoading {
+                                VStack(spacing: 10) {
+                                    ProgressView()
+                                    Text("Loading...")
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            } else if categoryDetailTransactions.isEmpty {
+                                VStack(spacing: 10) {
+                                    Text("No transactions this month")
+                                        .font(.headline)
+                                    Text("No entries yet for \(target.name).")
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            } else {
+                                List(categoryDetailTransactions) { item in
+                                    RecentTransactionRow(item: item)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            categoryEditingTarget = EditingTarget(id: item.transaction.id)
                                         }
-                                    }
-                                    .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
+                                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                            Button(role: .destructive) {
+                                                pendingDeleteItem = item
+                                                isShowingDeleteConfirm = true
+                                            } label: {
+                                                Image(systemName: "trash")
+                                            }
+                                        }
+                                        .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
+                                }
+                                .listStyle(.plain)
                             }
-                            .listStyle(.plain)
                         }
                     }
                     .navigationTitle(target.name)
@@ -213,8 +241,8 @@ struct HomeView: View {
                     .sheet(item: $categoryEditingTarget) { target in
                         AddEditTransactionView(
                             viewModel: AddEditTransactionViewModel(mode: .edit(existingID: target.id), service: transactionService),
-                            onSaved: { savedID, isNew in
-                                viewModel.didSaveTransaction(localID: savedID, isNew: isNew)
+                            onSaved: { savedID, isNew, originalDraft in
+                                viewModel.didSaveTransaction(localID: savedID, isNew: isNew, originalDraft: originalDraft)
                                 guard let categoryID = categoryDetailTarget?.id else { return }
                                 Task {
                                     do {
@@ -235,12 +263,12 @@ struct HomeView: View {
                 Button("Delete", role: .destructive) {
                     guard let item = pendingDeleteItem else { return }
                     categoryDetailTransactions.removeAll { $0.id == item.id }
-                    viewModel.delete(item)
+                    viewModel.delete(item.transaction)
                     pendingDeleteItem = nil
                 }
             } message: {
                 if let item = pendingDeleteItem {
-                    Text("\(item.payeeName) • \(MoneyFormatter.display(minor: item.amountMinor))")
+                    Text("\(item.transaction.payeeName) • \(MoneyFormatter.display(minor: item.transaction.amountMinor))")
                 } else {
                     Text("This cannot be undone.")
                 }
@@ -290,10 +318,13 @@ struct HomeView: View {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Text("Tracked Budgets")
                     .font(.headline.weight(.semibold))
+                    .lineLimit(1)
                 Spacer()
                 Text(MoneyFormatter.display(minor: trackedBudgetsTotalRemaining))
                     .font(.headline.weight(.bold))
                     .foregroundStyle(trackedBudgetsTotalRemaining < 0 ? .red : .primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                     .frame(width: BudgetListLayout.amountColumnWidth, alignment: .trailing)
                 Image(systemName: "chevron.right")
                     .font(.footnote.weight(.semibold))
@@ -335,10 +366,13 @@ struct HomeView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text("Other Budgets")
                         .font(.headline.weight(.semibold))
+                        .lineLimit(1)
                     Spacer()
                     Text(MoneyFormatter.display(minor: otherBudgetsTotalRemaining))
                         .font(.headline.weight(.bold))
                         .foregroundStyle(otherBudgetsTotalRemaining < 0 ? .red : .primary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                         .frame(width: BudgetListLayout.amountColumnWidth, alignment: .trailing)
                     Image(systemName: isOtherBudgetsExpanded ? "chevron.up" : "chevron.down")
                         .font(.footnote.weight(.semibold))
@@ -383,11 +417,15 @@ struct HomeView: View {
         }
     }
 
+    private static let monthNameFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .autoupdatingCurrent
+        f.setLocalizedDateFormatFromTemplate("MMMM")
+        return f
+    }()
+
     private var monthBudgetTitle: String {
-        let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.setLocalizedDateFormatFromTemplate("MMMM")
-        return "\(formatter.string(from: .now)) Budget"
+        "\(Self.monthNameFormatter.string(from: .now)) Budget"
     }
 
     private var topBarGradientBase: Color {
@@ -419,55 +457,35 @@ struct HomeView: View {
     }
 
     private var syncStatusBadge: some View {
-        HStack(spacing: 6) {
-            Image(systemName: viewModel.syncStatusIcon)
-                .font(.caption.weight(.semibold))
-            Text(viewModel.syncStatusText)
-                .font(.caption.weight(.semibold))
-                .lineLimit(1)
+        Button {
+            guard viewModel.canReviewBlockedMutations else { return }
+            isShowingSyncReview = true
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: viewModel.syncStatusIcon)
+                    .font(.caption.weight(.semibold))
+                Text(viewModel.syncStatusText)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(viewModel.syncStatusIsActive ? Color.accentColor : .secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
         }
-        .foregroundStyle(viewModel.syncStatusIsActive ? Color.accentColor : .secondary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule())
+        .buttonStyle(.plain)
         .accessibilityLabel("Sync status: \(viewModel.syncStatusText)")
+        .disabled(!viewModel.canReviewBlockedMutations)
     }
 
     private static func displayGroupName(_ raw: String?) -> String {
         let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !value.isEmpty else { return "Ungrouped" }
-        if looksLikeIdentifier(value) {
-            return "Ungrouped"
-        }
-        return value
-    }
-
-    private static func looksLikeIdentifier(_ value: String) -> Bool {
-        if UUID(uuidString: value) != nil {
-            return true
-        }
-        let lower = value.lowercased()
-        let hasSpace = lower.contains(" ")
-        if !hasSpace,
-           lower.range(of: "^[a-f0-9]{16,}$", options: .regularExpression) != nil {
-            return true
-        }
-        if !hasSpace,
-           lower.range(of: "^[a-z0-9_-]{20,}$", options: .regularExpression) != nil {
-            return true
-        }
-        if !hasSpace {
-            let letters = lower.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
-            let digits = lower.unicodeScalars.filter { CharacterSet.decimalDigits.contains($0) }.count
-            if lower.count >= 10 && letters > 0 && digits > 0 {
-                return true
-            }
-        }
-        return false
+        return IdentifierHeuristics.looksLikeOpaqueIdentifier(value) ? "Ungrouped" : value
     }
 
     private func openCategoryDetail(_ status: CategoryBudgetStatus) {
-        categoryDetailTarget = CategoryDetailTarget(id: status.id, name: status.name)
+        categoryDetailTarget = CategoryDetailTarget(status: status)
         categoryDetailTransactions = []
         isCategoryDetailLoading = true
         categoryEditingTarget = nil
@@ -490,6 +508,39 @@ struct HomeView: View {
 
 private struct EditingTarget: Identifiable {
     let id: UUID
+}
+
+private struct CategoryBudgetHeader: View {
+    let status: CategoryBudgetStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("\(status.name) Budget")
+                .font(.title3.weight(.semibold))
+
+            Text(status.isOverBudget
+                 ? "\(MoneyFormatter.display(minor: abs(status.remainingMinor))) over"
+                 : MoneyFormatter.display(minor: status.remainingMinor))
+                .font(.system(size: 40, weight: .bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .padding(.top, 22)
+
+            Text("\(MoneyFormatter.display(minor: status.spentMinor)) of \(MoneyFormatter.display(minor: status.budgetedMinor)) spent")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+
+            ProgressView(value: status.progress)
+                .tint(status.isOverBudget ? .red : .green)
+                .scaleEffect(x: 1, y: 1.45, anchor: .center)
+                .padding(.top, 20)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 24)
+        .padding(.bottom, 18)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
 }
 
 private struct ExpenseCategoryRow: View {
@@ -522,8 +573,10 @@ private struct ExpenseCategoryRow: View {
 }
 
 private struct CategoryDetailTarget: Identifiable {
-    let id: String
-    let name: String
+    let status: CategoryBudgetStatus
+
+    var id: String { status.id }
+    var name: String { status.name }
 }
 
 private struct OtherBudgetGroup: Identifiable {
@@ -534,7 +587,7 @@ private struct OtherBudgetGroup: Identifiable {
 }
 
 private struct RecentTransactionRow: View {
-    let item: RecentTransactionItem
+    let item: CategoryDetailTransactionItem
     private static let rawDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -553,17 +606,17 @@ private struct RecentTransactionRow: View {
             Text(displayDateText)
                 .font(.footnote.monospacedDigit())
                 .foregroundStyle(.secondary)
-            Text(item.payeeName)
+            Text(item.transaction.payeeName)
                 .font(.body.weight(.semibold))
                 .lineLimit(1)
                 .truncationMode(.tail)
-            Text(item.categorySummary)
+            Text(item.transaction.categorySummary)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 8)
-            Text(MoneyFormatter.display(minor: item.amountMinor))
+            Text(MoneyFormatter.display(minor: item.displayAmountMinor))
                 .font(.body.weight(.bold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
@@ -575,9 +628,136 @@ private struct RecentTransactionRow: View {
     }
 
     private var displayDateText: String {
-        guard let date = Self.rawDateFormatter.date(from: item.date.value) else {
-            return item.date.value
+        guard let date = Self.rawDateFormatter.date(from: item.transaction.date.value) else {
+            return item.transaction.date.value
         }
         return Self.displayDateFormatter.string(from: date)
+    }
+}
+
+private struct BlockedSyncReviewSheet: View {
+    let items: [BlockedMutationReviewItem]
+    let onRetry: (BlockedMutationReviewItem) -> Void
+    let onDismiss: (BlockedMutationReviewItem) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if items.isEmpty {
+                    ContentUnavailableView(
+                        "No sync items need review",
+                        systemImage: "checkmark.circle",
+                        description: Text("Blocked sync items will appear here.")
+                    )
+                } else {
+                    List(items) { item in
+                        BlockedSyncReviewRow(
+                            item: item,
+                            onRetry: { onRetry(item) },
+                            onDismiss: { onDismiss(item) }
+                        )
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("Sync Review")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct BlockedSyncReviewRow: View {
+    let item: BlockedMutationReviewItem
+    let onRetry: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title)
+                    .font(.headline)
+                Spacer(minLength: 12)
+                Text(typeLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            if let subtitle {
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(item.lastError)
+                .font(.footnote)
+                .foregroundStyle(.orange)
+
+            Text(createdAtText)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+
+            HStack(spacing: 10) {
+                Button("Retry", action: onRetry)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                Button("Dismiss", role: .destructive, action: onDismiss)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private var title: String {
+        if let transaction = item.transaction {
+            return transaction.payeeName
+        }
+        if let proposedPayeeName = item.proposedPayeeName, !proposedPayeeName.isEmpty {
+            return proposedPayeeName
+        }
+        return typeLabel
+    }
+
+    private var subtitle: String? {
+        if let transaction = item.transaction {
+            let amount = MoneyFormatter.display(minor: transaction.amountMinor)
+            let parts = [
+                transaction.date.value,
+                amount,
+                transaction.categorySummary.isEmpty ? nil : transaction.categorySummary,
+                transaction.note.isEmpty ? nil : transaction.note
+            ].compactMap { $0 }
+            return parts.joined(separator: " • ")
+        }
+        if item.type == .createPayee {
+            return "New payee pending verification"
+        }
+        return nil
+    }
+
+    private var typeLabel: String {
+        switch item.type {
+        case .createTransaction:
+            return "Create transaction"
+        case .updateTransaction:
+            return "Update transaction"
+        case .deleteTransaction:
+            return "Delete transaction"
+        case .createPayee:
+            return "Create payee"
+        }
+    }
+
+    private var createdAtText: String {
+        item.createdAt.formatted(date: .abbreviated, time: .shortened)
     }
 }

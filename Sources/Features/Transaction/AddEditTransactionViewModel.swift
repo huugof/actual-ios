@@ -37,6 +37,7 @@ final class AddEditTransactionViewModel: ObservableObject {
     private let mode: Mode
     private let service: TransactionService
     private var existingRemoteID: String?
+    private(set) var originalDraft: TransactionDraft?
 
     var title: String {
         mode.isNew ? "Add Transaction" : "Edit Transaction"
@@ -372,6 +373,7 @@ final class AddEditTransactionViewModel: ObservableObject {
 
     private func preload(existingID: UUID) async throws {
         guard let draft = try await service.loadDraft(localID: existingID) else { return }
+        originalDraft = draft
         existingRemoteID = draft.remoteID
         amountText = draft.amountMinor == 0 ? "" : MoneyFormatter.currencyInputText(minor: draft.amountMinor)
         selectedPayee = draft.payee
