@@ -11,7 +11,7 @@ protocol ActualAPIClientProtocol: Sendable {
         daysBack: Int,
         accountIDs: [String]?,
         allowPartialFailures: Bool
-    ) async throws -> [RecentTransactionItem]
+    ) async throws -> [SyncedRecentTransactionItem]
     func createPayee(name: String) async throws -> Payee
     func createTransaction(payload: APICreateTransactionPayload) async throws -> APISavedTransaction
     func updateTransaction(id: String, payload: APIUpdateTransactionPayload) async throws -> APISavedTransaction
@@ -27,6 +27,7 @@ struct APICreateTransactionPayload: Codable, Sendable {
     let notes: String?
     let categoryID: String?
     let splits: [APISplitPayload]?
+    let importedID: String?
 }
 
 struct APIUpdateTransactionPayload: Codable, Sendable {
@@ -61,7 +62,9 @@ private extension APICreateTransactionPayload {
             payeeName: payeeName,
             notes: notes,
             category: categoryID,
-            subtransactions: splits?.map(\.transport)
+            subtransactions: splits?.map(\.transport),
+            importedID: importedID,
+            cleared: false
         )
     }
 }
@@ -76,7 +79,9 @@ private extension APIUpdateTransactionPayload {
             payeeName: payeeName,
             notes: notes,
             category: categoryID,
-            subtransactions: splits?.map(\.transport)
+            subtransactions: splits?.map(\.transport),
+            importedID: nil,
+            cleared: nil
         )
     }
 }
@@ -113,6 +118,8 @@ private struct APITransportTransaction: Codable {
     let notes: String?
     let category: String?
     let subtransactions: [APITransportSplit]?
+    let importedID: String?
+    let cleared: Bool?
 
     enum CodingKeys: String, CodingKey {
         case account
@@ -123,6 +130,8 @@ private struct APITransportTransaction: Codable {
         case notes
         case category
         case subtransactions
+        case importedID = "imported_id"
+        case cleared
     }
 }
 
@@ -296,7 +305,7 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
         daysBack: Int,
         accountIDs: [String]?,
         allowPartialFailures: Bool
-    ) async throws -> [RecentTransactionItem] {
+    ) async throws -> [SyncedRecentTransactionItem] {
         let accounts: [Account]
         if let accountIDs {
             let uniqueIDs = Self.uniquePreservingOrder(accountIDs)
@@ -356,33 +365,45 @@ struct ActualHTTPAPIClient: ActualAPIClientProtocol {
             let categoryIDs: [String]
             let isSplit: Bool
             let summary: String
+            let splits: [TransactionSplit]
 
             if let subs = dto.subtransactions, !subs.isEmpty {
                 categoryIDs = subs.map { $0.categoryID }
                 isSplit = true
                 summary = "Split (\(subs.count))"
+                splits = subs.enumerated().map { index, sub in
+                    TransactionSplit(
+                        id: stableUUID(from: "\(dto.id)#split#\(index)"),
+                        categoryID: sub.categoryID,
+                        amountMinor: sub.amountMinor
+                    )
+                }
             } else {
                 categoryIDs = dto.categoryID.map { [$0] } ?? []
                 isSplit = false
                 summary = dto.categoryName
                     ?? "Uncategorized"
+                splits = []
             }
 
-            return RecentTransactionItem(
-                id: stableUUID(from: dto.id),
-                remoteID: dto.id,
-                amountMinor: dto.amountMinor,
-                payeeName: dto.payeeName
-                    ?? dto.importedPayee
-                    ?? "Unknown",
-                payeeID: dto.payeeID,
-                accountID: dto.accountID,
-                date: LocalDate(dto.date),
-                note: dto.notes ?? "",
-                categorySummary: summary,
-                isSplit: isSplit,
-                categoryIDs: categoryIDs,
-                updatedAt: dto.updatedAt ?? .now
+            return SyncedRecentTransactionItem(
+                transaction: RecentTransactionItem(
+                    id: stableUUID(from: dto.id),
+                    remoteID: dto.id,
+                    amountMinor: dto.amountMinor,
+                    payeeName: dto.payeeName
+                        ?? dto.importedPayee
+                        ?? "Unknown",
+                    payeeID: dto.payeeID,
+                    accountID: dto.accountID,
+                    date: LocalDate(dto.date),
+                    note: dto.notes ?? "",
+                    categorySummary: summary,
+                    isSplit: isSplit,
+                    categoryIDs: categoryIDs,
+                    updatedAt: dto.updatedAt ?? .now
+                ),
+                splits: splits
             )
         }
     }
